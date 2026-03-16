@@ -8,7 +8,7 @@ If you use an AI coding agent (Cursor, Claude Code, Codex, etc.), the repo inclu
 
 | Skill | What it does | When to use |
 |---|---|---|
-| `update-docs-from-commits` | Scans recent commits for user-facing changes and drafts doc updates. | After landing features, before a release, or to find doc gaps. |
+| `update-docs` | Scans recent commits for user-facing changes and drafts doc updates. | After landing features, before a release, or to find doc gaps. |
 | `build-from-issue` | Plans and implements work from a GitHub issue, including doc updates. | When working from an issue that has doc impact. |
 
 The skills live in `.agents/skills/` and follow the style guide below automatically. To use one, ask your agent to run it (e.g., "catch up the docs for everything merged since v0.2.0").
@@ -110,7 +110,6 @@ These patterns are common in LLM-generated text and erode trust with technical r
 ### Formatting Rules
 
 - End every sentence with a period.
-- One sentence per line in the source file (makes diffs readable).
 - Use `code` formatting for CLI commands, file paths, flags, parameter names, and values.
 - Use code blocks with the `console` language for CLI examples. Prefix commands with `$`:
   ```console

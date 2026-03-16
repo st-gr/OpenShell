@@ -99,15 +99,13 @@ Install the CLI and create your first sandbox in two commands.
     <span class="nc-term-dot nc-term-dot-g"></span>
   </div>
   <div class="nc-term-body">
-    <div><span class="nc-ps">$ </span>uv pip install openshell</div>
+    <div><span class="nc-ps">$ </span>uv tool install -U openshell</div>
     <div><span class="nc-ps">$ </span>openshell sandbox create <span class="nc-swap"><span>-- <span class="nc-hl">claude</span></span><span>--from <span class="nc-hl">openclaw</span></span><span>-- <span class="nc-hl">opencode</span></span><span>-- <span class="nc-hl">codex</span></span></span><span class="nc-cursor"></span></div>
   </div>
 </div>
 ```
 
-Run `openshell --help` in your terminal to see the full CLI reference, including all commands and flags. You can also clone the [OpenShell repository](https://github.com/NVIDIA/OpenShell) and use the `/openshell-cli` skill to load the CLI reference into your agent.
-
-Proceed to the [Quickstart](get-started/quickstart.md) for more details.
+Refer to the [Quickstart](get-started/quickstart.md) for more details.
 
 ---
 
