@@ -47,7 +47,21 @@ impl L7Provider for RestProvider {
         reason: &str,
         client: &mut C,
     ) -> Result<()> {
-        send_deny_response(req, policy_name, reason, client).await
+        send_deny_response(req, policy_name, reason, client, None).await
+    }
+}
+
+impl RestProvider {
+    /// Deny with a redacted target for the response body.
+    pub(crate) async fn deny_with_redacted_target<C: AsyncRead + AsyncWrite + Unpin + Send>(
+        &self,
+        req: &L7Request,
+        policy_name: &str,
+        reason: &str,
+        client: &mut C,
+        redacted_target: Option<&str>,
+    ) -> Result<()> {
+        send_deny_response(req, policy_name, reason, client, redacted_target).await
     }
 }
 
@@ -247,10 +261,11 @@ where
         .position(|w| w == b"\r\n\r\n")
         .map_or(req.raw_header.len(), |p| p + 4);
 
-    let rewritten_header = rewrite_http_header_block(&req.raw_header[..header_end], resolver);
+    let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
+        .map_err(|e| miette!("credential injection failed: {e}"))?;
 
     upstream
-        .write_all(&rewritten_header)
+        .write_all(&rewrite_result.rewritten)
         .await
         .into_diagnostic()?;
 
@@ -278,16 +293,21 @@ where
 }
 
 /// Send a 403 Forbidden JSON deny response.
+///
+/// When `redacted_target` is provided, it is used instead of `req.target`
+/// in the response body to avoid leaking resolved credential values.
 async fn send_deny_response<C: AsyncWrite + Unpin>(
     req: &L7Request,
     policy_name: &str,
     reason: &str,
     client: &mut C,
+    redacted_target: Option<&str>,
 ) -> Result<()> {
+    let target = redacted_target.unwrap_or(&req.target);
     let body = serde_json::json!({
         "error": "policy_denied",
         "policy": policy_name,
-        "rule": format!("{} {}", req.action, req.target),
+        "rule": format!("{} {}", req.action, target),
         "detail": reason
     });
     let body_bytes = body.to_string();
@@ -742,6 +762,7 @@ fn is_benign_close(err: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use crate::secrets::SecretResolver;
+    use base64::Engine as _;
 
     #[test]
     fn parse_content_length() {
@@ -1371,8 +1392,8 @@ mod tests {
         );
         let raw = b"GET /v1/messages HTTP/1.1\r\nAuthorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY\r\nHost: example.com\r\n\r\n";
 
-        let rewritten = rewrite_http_header_block(raw, resolver.as_ref());
-        let rewritten = String::from_utf8(rewritten).expect("utf8");
+        let result = rewrite_http_header_block(raw, resolver.as_ref()).expect("should succeed");
+        let rewritten = String::from_utf8(result.rewritten).expect("utf8");
 
         assert!(rewritten.contains("Authorization: Bearer sk-test\r\n"));
         assert!(!rewritten.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
@@ -1550,6 +1571,378 @@ mod tests {
         assert!(
             !forwarded.contains("nvapi-secret"),
             "Real secret should NOT appear without resolver, got: {forwarded}"
+        );
+    }
+
+    // =========================================================================
+    // Credential injection integration tests
+    //
+    // Each test exercises a different injection location through the full
+    // relay_http_request_with_resolver pipeline: child builds an HTTP request
+    // with a placeholder, the relay rewrites it, and we verify what upstream
+    // receives.
+    // =========================================================================
+
+    /// Helper: run a request through the relay and capture what upstream receives.
+    async fn relay_and_capture(
+        raw_header: Vec<u8>,
+        body_length: BodyLength,
+        resolver: Option<&SecretResolver>,
+    ) -> Result<String> {
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        // Parse the request line to extract action and target for L7Request
+        let header_str = String::from_utf8_lossy(&raw_header);
+        let first_line = header_str.lines().next().unwrap_or("");
+        let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
+        let action = parts.first().unwrap_or(&"GET").to_string();
+        let target = parts.get(1).unwrap_or(&"/").to_string();
+
+        let req = L7Request {
+            action,
+            target,
+            query_params: HashMap::new(),
+            raw_header,
+            body_length,
+        };
+
+        let content_len = match body_length {
+            BodyLength::ContentLength(n) => n,
+            _ => 0,
+        };
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let mut total = 0;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if let Some(hdr_end) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n") {
+                    if total >= hdr_end + 4 + content_len as usize {
+                        break;
+                    }
+                }
+            }
+            upstream_side
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+            String::from_utf8_lossy(&buf[..total]).to_string()
+        });
+
+        let relay = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            relay_http_request_with_resolver(
+                &req,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                resolver,
+            ),
+        )
+        .await
+        .map_err(|_| miette!("relay timed out"))?;
+        relay?;
+
+        let forwarded = upstream_task
+            .await
+            .map_err(|e| miette!("upstream task failed: {e}"))?;
+        Ok(forwarded)
+    }
+
+    #[tokio::test]
+    async fn relay_injects_bearer_header_credential() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("API_KEY".to_string(), "sk-real-secret-key".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let placeholder = child_env.get("API_KEY").unwrap();
+
+        let raw = format!(
+            "POST /v1/chat HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Authorization: Bearer {placeholder}\r\n\
+             Content-Length: 2\r\n\r\n{{}}"
+        );
+
+        let forwarded = relay_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(2),
+            resolver.as_ref(),
+        )
+        .await
+        .expect("relay should succeed");
+
+        assert!(
+            forwarded.contains("Authorization: Bearer sk-real-secret-key\r\n"),
+            "Upstream should see real Bearer token, got: {forwarded}"
+        );
+        assert!(
+            !forwarded.contains("openshell:resolve:env:"),
+            "Placeholder leaked to upstream: {forwarded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_injects_exact_header_credential() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("CUSTOM_TOKEN".to_string(), "tok-12345".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let placeholder = child_env.get("CUSTOM_TOKEN").unwrap();
+
+        let raw = format!(
+            "GET /api/data HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             x-api-key: {placeholder}\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+
+        let forwarded = relay_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(0),
+            resolver.as_ref(),
+        )
+        .await
+        .expect("relay should succeed");
+
+        assert!(
+            forwarded.contains("x-api-key: tok-12345\r\n"),
+            "Upstream should see real x-api-key, got: {forwarded}"
+        );
+        assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_injects_basic_auth_credential() {
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("REGISTRY_PASS".to_string(), "hunter2".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let placeholder = child_env.get("REGISTRY_PASS").unwrap();
+        let encoded = b64.encode(format!("deploy:{placeholder}").as_bytes());
+
+        let raw = format!(
+            "GET /v2/_catalog HTTP/1.1\r\n\
+             Host: registry.example.com\r\n\
+             Authorization: Basic {encoded}\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+
+        let forwarded = relay_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(0),
+            resolver.as_ref(),
+        )
+        .await
+        .expect("relay should succeed");
+
+        // Extract and decode the Basic auth token from what upstream received
+        let auth_line = forwarded
+            .lines()
+            .find(|l| l.starts_with("Authorization: Basic"))
+            .expect("upstream should have Authorization header");
+        let token = auth_line
+            .strip_prefix("Authorization: Basic ")
+            .unwrap()
+            .trim();
+        let decoded = b64.decode(token).expect("valid base64");
+        let decoded_str = std::str::from_utf8(&decoded).expect("valid utf8");
+
+        assert_eq!(
+            decoded_str, "deploy:hunter2",
+            "Decoded Basic auth should contain real password"
+        );
+        assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_injects_query_param_credential() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("YOUTUBE_KEY".to_string(), "AIzaSy-secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let placeholder = child_env.get("YOUTUBE_KEY").unwrap();
+
+        let raw = format!(
+            "GET /v3/search?part=snippet&key={placeholder} HTTP/1.1\r\n\
+             Host: www.googleapis.com\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+
+        let forwarded = relay_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(0),
+            resolver.as_ref(),
+        )
+        .await
+        .expect("relay should succeed");
+
+        assert!(
+            forwarded.contains("key=AIzaSy-secret"),
+            "Upstream should see real API key in query param, got: {forwarded}"
+        );
+        assert!(
+            forwarded.contains("part=snippet"),
+            "Non-secret query params should be preserved, got: {forwarded}"
+        );
+        assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_injects_url_path_credential_telegram_style() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [(
+                "TELEGRAM_TOKEN".to_string(),
+                "123456:ABC-DEF1234ghIkl".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let placeholder = child_env.get("TELEGRAM_TOKEN").unwrap();
+
+        let raw = format!(
+            "POST /bot{placeholder}/sendMessage HTTP/1.1\r\n\
+             Host: api.telegram.org\r\n\
+             Content-Length: 2\r\n\r\n{{}}"
+        );
+
+        let forwarded = relay_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(2),
+            resolver.as_ref(),
+        )
+        .await
+        .expect("relay should succeed");
+
+        assert!(
+            forwarded.contains("POST /bot123456:ABC-DEF1234ghIkl/sendMessage HTTP/1.1"),
+            "Upstream should see real token in URL path, got: {forwarded}"
+        );
+        assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_injects_url_path_credential_standalone_segment() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("ORG_TOKEN".to_string(), "org-abc-789".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let placeholder = child_env.get("ORG_TOKEN").unwrap();
+
+        let raw = format!(
+            "GET /api/{placeholder}/resources HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+
+        let forwarded = relay_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(0),
+            resolver.as_ref(),
+        )
+        .await
+        .expect("relay should succeed");
+
+        assert!(
+            forwarded.contains("GET /api/org-abc-789/resources HTTP/1.1"),
+            "Upstream should see real token in path segment, got: {forwarded}"
+        );
+        assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_injects_combined_path_and_header_credentials() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [
+                ("PATH_TOKEN".to_string(), "tok-path-123".to_string()),
+                ("HEADER_KEY".to_string(), "sk-header-456".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let path_ph = child_env.get("PATH_TOKEN").unwrap();
+        let header_ph = child_env.get("HEADER_KEY").unwrap();
+
+        let raw = format!(
+            "POST /bot{path_ph}/send HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             x-api-key: {header_ph}\r\n\
+             Content-Length: 2\r\n\r\n{{}}"
+        );
+
+        let forwarded = relay_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(2),
+            resolver.as_ref(),
+        )
+        .await
+        .expect("relay should succeed");
+
+        assert!(
+            forwarded.contains("/bottok-path-123/send"),
+            "Upstream should see real token in path, got: {forwarded}"
+        );
+        assert!(
+            forwarded.contains("x-api-key: sk-header-456\r\n"),
+            "Upstream should see real token in header, got: {forwarded}"
+        );
+        assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_fail_closed_rejects_unresolved_placeholder() {
+        // Create a resolver that knows about KEY1 but not UNKNOWN_KEY
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("KEY1".to_string(), "secret1".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let _ = child_env;
+
+        // The request references a placeholder that the resolver doesn't know
+        let raw = b"GET /api HTTP/1.1\r\n\
+             Host: example.com\r\n\
+             x-api-key: openshell:resolve:env:UNKNOWN_KEY\r\n\
+             Content-Length: 0\r\n\r\n"
+            .to_vec();
+
+        let result = relay_and_capture(raw, BodyLength::ContentLength(0), resolver.as_ref()).await;
+
+        assert!(
+            result.is_err(),
+            "Relay should fail when placeholder cannot be resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_fail_closed_rejects_unresolved_path_placeholder() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("KEY1".to_string(), "secret1".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        let raw =
+            b"GET /api/openshell:resolve:env:UNKNOWN_KEY/data HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+                .to_vec();
+
+        let result = relay_and_capture(raw, BodyLength::ContentLength(0), resolver.as_ref()).await;
+
+        assert!(
+            result.is_err(),
+            "Relay should fail when path placeholder cannot be resolved"
         );
     }
 }
