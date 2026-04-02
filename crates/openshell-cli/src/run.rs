@@ -1369,62 +1369,51 @@ pub async fn gateway_admin_deploy(
         opts
     });
 
-    // Check whether a gateway already exists. If so, prompt the user (unless
-    // --recreate was passed or we're in non-interactive mode).
-    let mut should_recreate = recreate;
-    if let Some(existing) =
-        openshell_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
-    {
-        if !should_recreate {
-            let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-            if interactive {
-                let status = if existing.container_running {
-                    "running"
-                } else if existing.container_exists {
-                    "stopped"
-                } else {
-                    "volume only"
-                };
-                eprintln!();
+    // If the gateway is already running and we're not recreating, short-circuit.
+    if !recreate {
+        if let Some(existing) =
+            openshell_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
+        {
+            if existing.container_running {
                 eprintln!(
-                    "{} Gateway '{name}' already exists ({status}).",
-                    "!".yellow().bold()
+                    "{} Gateway '{name}' is already running.",
+                    "✓".green().bold()
                 );
-                if let Some(image) = &existing.container_image {
-                    eprintln!("  {} {}", "Image:".dimmed(), image);
-                }
-                eprintln!();
-                eprint!("Destroy and recreate? [y/N] ");
-                std::io::stderr().flush().ok();
-                let mut input = String::new();
-                std::io::stdin()
-                    .read_line(&mut input)
-                    .into_diagnostic()
-                    .wrap_err("failed to read user input")?;
-                let choice = input.trim().to_lowercase();
-                should_recreate = choice == "y" || choice == "yes";
-                if !should_recreate {
-                    eprintln!("Keeping existing gateway.");
-                    return Ok(());
-                }
-            } else {
-                // Non-interactive mode: reuse existing gateway silently.
-                eprintln!("Gateway '{name}' already exists, reusing.");
                 return Ok(());
             }
         }
     }
 
+    // When resuming an existing gateway (not recreating), prefer the port
+    // and gateway host from stored metadata over the CLI defaults.  The user
+    // may have originally bootstrapped on a non-default port (e.g. `--port
+    // 8082`) or with `--gateway-host host.docker.internal`, and a bare
+    // `gateway start` without those flags should honour the original values.
+    let stored_metadata = if !recreate {
+        openshell_bootstrap::load_gateway_metadata(name).ok()
+    } else {
+        None
+    };
+    let effective_port = stored_metadata
+        .as_ref()
+        .filter(|m| m.gateway_port > 0)
+        .map_or(port, |m| m.gateway_port);
+    let effective_gateway_host: Option<String> = gateway_host.map(String::from).or_else(|| {
+        stored_metadata
+            .as_ref()
+            .and_then(|m| m.gateway_host().map(String::from))
+    });
+
     let mut options = DeployOptions::new(name)
-        .with_port(port)
+        .with_port(effective_port)
         .with_disable_tls(disable_tls)
         .with_disable_gateway_auth(disable_gateway_auth)
         .with_gpu(gpu)
-        .with_recreate(should_recreate);
+        .with_recreate(recreate);
     if let Some(opts) = remote_opts {
         options = options.with_remote(opts);
     }
-    if let Some(host) = gateway_host {
+    if let Some(host) = effective_gateway_host {
         options = options.with_gateway_host(host);
     }
     if let Some(username) = registry_username {
@@ -1435,6 +1424,15 @@ pub async fn gateway_admin_deploy(
     }
 
     let handle = deploy_gateway_with_panel(options, name, location).await?;
+
+    // Wait for the gRPC endpoint to actually accept connections before
+    // declaring the gateway ready. The Docker health check may pass before
+    // the gRPC listener inside the pod is fully bound.
+    let server = handle.gateway_endpoint().to_string();
+    let tls = TlsOptions::default()
+        .with_gateway_name(name)
+        .with_default_paths(&server);
+    crate::bootstrap::wait_for_grpc_ready(&server, &tls).await?;
 
     print_deploy_summary(name, &handle);
 
