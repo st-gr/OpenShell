@@ -32,7 +32,11 @@ const INFERENCE_LOCAL_HOST: &str = "inference.local";
 const MAX_STREAMING_BODY: usize = 32 * 1024 * 1024;
 
 /// Idle timeout per chunk when relaying streaming inference responses.
-const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+///
+/// Reasoning models (e.g. nemotron-3-super, o1, o3) can pause for 60+ seconds
+/// between "thinking" and output phases. 120s provides headroom while still
+/// catching genuinely stuck streams.
+const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Result of a proxy CONNECT policy decision.
 struct ConnectDecision {
@@ -1236,6 +1240,7 @@ async fn route_inference_request(
             Ok(mut resp) => {
                 use crate::l7::inference::{
                     format_chunk, format_chunk_terminator, format_http_response_header,
+                    format_sse_error,
                 };
 
                 let resp_headers = sanitize_inference_response_headers(
@@ -1247,6 +1252,13 @@ async fn route_inference_request(
                 write_all(tls_client, &header_bytes).await?;
 
                 // Stream body chunks with byte cap and idle timeout.
+                //
+                // Each upstream chunk is wrapped in HTTP chunked framing and
+                // flushed immediately so SSE events reach the client without
+                // delay. Unlike the previous per-byte write_all+flush, we
+                // coalesce the framing header + data + trailer into a single
+                // write_all call, reducing the number of TLS records per chunk
+                // from 3 to 1 while preserving incremental delivery.
                 let mut total_bytes: usize = 0;
                 loop {
                     match tokio::time::timeout(CHUNK_IDLE_TIMEOUT, resp.next_chunk()).await {
@@ -1258,6 +1270,10 @@ async fn route_inference_request(
                                     limit = MAX_STREAMING_BODY,
                                     "streaming response exceeded byte limit, truncating"
                                 );
+                                let err = format_sse_error(
+                                    "response truncated: exceeded maximum streaming body size",
+                                );
+                                let _ = write_all(tls_client, &format_chunk(&err)).await;
                                 break;
                             }
                             let encoded = format_chunk(&chunk);
@@ -1267,23 +1283,34 @@ async fn route_inference_request(
                         Ok(Err(e)) => {
                             let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
                                 .activity(ActivityId::Fail)
-                                .severity(SeverityId::Low)
+                                .severity(SeverityId::Medium)
                                 .status(StatusId::Failure)
                                 .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, 443))
-                                .message(format!("error reading upstream response chunk: {e}"))
+                                .message(format!(
+                                    "error reading upstream response chunk after \
+                                     {total_bytes} bytes: {e}"
+                                ))
                                 .build();
                             ocsf_emit!(event);
+                            let err = format_sse_error("response truncated: upstream read error");
+                            let _ = write_all(tls_client, &format_chunk(&err)).await;
                             break;
                         }
                         Err(_) => {
                             let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
                                 .activity(ActivityId::Fail)
-                                .severity(SeverityId::Low)
+                                .severity(SeverityId::Medium)
                                 .status(StatusId::Failure)
                                 .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, 443))
-                                .message("streaming response chunk idle timeout, closing")
+                                .message(format!(
+                                    "streaming response chunk idle timeout after \
+                                     {total_bytes} bytes, closing"
+                                ))
                                 .build();
                             ocsf_emit!(event);
+                            let err =
+                                format_sse_error("response truncated: chunk idle timeout exceeded");
+                            let _ = write_all(tls_client, &format_chunk(&err)).await;
                             break;
                         }
                     }
