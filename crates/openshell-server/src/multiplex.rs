@@ -62,7 +62,17 @@ impl MultiplexService {
 
         let service = MultiplexedService::new(grpc_service, http_service);
 
-        Builder::new(TokioExecutor::new())
+        // HTTP/2 adaptive flow control. Default windows (64 KiB / 64 KiB)
+        // throttle the RelayStream data plane to ~500 Mbps on LAN. Instead
+        // of committing to a fixed large window (which worst-case pins
+        // `max_concurrent_streams × stream_window` bytes per connection),
+        // we let hyper/h2 auto-size based on the measured bandwidth-delay
+        // product. Idle streams stay tiny; busy bulk streams grow as
+        // needed. Overrides any fixed initial_*_window_size settings.
+        let mut builder = Builder::new(TokioExecutor::new());
+        builder.http2().adaptive_window(true);
+
+        builder
             .serve_connection_with_upgrades(TokioIo::new(stream), service)
             .await?;
 

@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    GUEST_SSH_PORT,
-    rootfs::{extract_sandbox_rootfs_to, sandbox_guest_init_path},
-};
+use crate::rootfs::{extract_sandbox_rootfs_to, sandbox_guest_init_path};
 use futures::Stream;
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
@@ -14,21 +11,18 @@ use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus, GetCapabilitiesRequest,
     GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest,
-    ListSandboxesResponse, ResolveSandboxEndpointRequest, ResolveSandboxEndpointResponse,
-    SandboxEndpoint, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
-    compute_driver_server::ComputeDriver, sandbox_endpoint, watch_sandboxes_event,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -39,6 +33,7 @@ const DRIVER_NAME: &str = "openshell-driver-vm";
 const WATCH_BUFFER: usize = 256;
 const DEFAULT_VCPUS: u8 = 2;
 const DEFAULT_MEM_MIB: u32 = 2048;
+const GUEST_SSH_SOCKET_PATH: &str = "/run/openshell/ssh.sock";
 const GUEST_TLS_DIR: &str = "/opt/openshell/tls";
 const GUEST_TLS_CA_PATH: &str = "/opt/openshell/tls/ca.crt";
 const GUEST_TLS_CERT_PATH: &str = "/opt/openshell/tls/tls.crt";
@@ -168,7 +163,6 @@ struct VmProcess {
 #[derive(Debug)]
 struct SandboxRecord {
     snapshot: Sandbox,
-    ssh_port: u16,
     state_dir: PathBuf,
     process: Arc<Mutex<VmProcess>>,
 }
@@ -236,7 +230,6 @@ impl VmDriver {
             return Err(Status::already_exists("sandbox already exists"));
         }
 
-        let ssh_port = allocate_local_port()?;
         let state_dir = sandbox_state_dir(&self.config.state_dir, &sandbox.id);
         let rootfs = state_dir.join("rootfs");
 
@@ -279,9 +272,6 @@ impl VmDriver {
             .arg("--vm-krun-log-level")
             .arg(self.config.krun_log_level.to_string());
         command.arg("--vm-console-output").arg(&console_output);
-        command
-            .arg("--vm-port")
-            .arg(format!("{ssh_port}:{GUEST_SSH_PORT}"));
         for env in build_guest_environment(sandbox, &self.config) {
             command.arg("--vm-env").arg(env);
         }
@@ -308,7 +298,6 @@ impl VmDriver {
                 sandbox.id.clone(),
                 SandboxRecord {
                     snapshot: snapshot.clone(),
-                    ssh_port,
                     state_dir: state_dir.clone(),
                     process: process.clone(),
                 },
@@ -385,25 +374,6 @@ impl VmDriver {
         Ok(DeleteSandboxResponse { deleted: true })
     }
 
-    pub async fn resolve_endpoint(
-        &self,
-        sandbox: &Sandbox,
-    ) -> Result<ResolveSandboxEndpointResponse, Status> {
-        let registry = self.registry.lock().await;
-        let record = registry.get(&sandbox.id).or_else(|| {
-            registry
-                .values()
-                .find(|record| record.snapshot.name == sandbox.name)
-        });
-        let record = record.ok_or_else(|| Status::not_found("sandbox not found"))?;
-        Ok(ResolveSandboxEndpointResponse {
-            endpoint: Some(SandboxEndpoint {
-                target: Some(sandbox_endpoint::Target::Host("127.0.0.1".to_string())),
-                port: u32::from(record.ssh_port),
-            }),
-        })
-    }
-
     pub async fn get_sandbox(
         &self,
         sandbox_id: &str,
@@ -437,16 +407,12 @@ impl VmDriver {
         let mut ready_emitted = false;
 
         loop {
-            let (process, ssh_port, state_dir) = {
+            let (process, state_dir) = {
                 let registry = self.registry.lock().await;
                 let Some(record) = registry.get(&sandbox_id) else {
                     return;
                 };
-                (
-                    record.process.clone(),
-                    record.ssh_port,
-                    record.state_dir.clone(),
-                )
+                (record.process.clone(), record.state_dir.clone())
             };
 
             let exit_status = {
@@ -503,8 +469,7 @@ impl VmDriver {
                 return;
             }
 
-            if !ready_emitted && port_is_ready(ssh_port).await && guest_ssh_ready(&state_dir).await
-            {
+            if !ready_emitted && guest_ssh_ready(&state_dir).await {
                 if let Some(snapshot) = self
                     .set_snapshot_condition(&sandbox_id, ready_condition(), false)
                     .await
@@ -649,17 +614,6 @@ impl ComputeDriver for VmDriver {
         Ok(Response::new(response))
     }
 
-    async fn resolve_sandbox_endpoint(
-        &self,
-        request: Request<ResolveSandboxEndpointRequest>,
-    ) -> Result<Response<ResolveSandboxEndpointResponse>, Status> {
-        let sandbox = request
-            .into_inner()
-            .sandbox
-            .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        Ok(Response::new(self.resolve_endpoint(&sandbox).await?))
-    }
-
     type WatchSandboxesStream =
         Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send + 'static>>;
 
@@ -794,16 +748,8 @@ fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<St
         ("OPENSHELL_SANDBOX_ID".to_string(), sandbox.id.clone()),
         ("OPENSHELL_SANDBOX".to_string(), sandbox.name.clone()),
         (
-            "OPENSHELL_SSH_LISTEN_ADDR".to_string(),
-            format!("0.0.0.0:{GUEST_SSH_PORT}"),
-        ),
-        (
-            "OPENSHELL_SSH_HANDSHAKE_SECRET".to_string(),
-            config.ssh_handshake_secret.clone(),
-        ),
-        (
-            "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS".to_string(),
-            config.ssh_handshake_skew_secs.to_string(),
+            "OPENSHELL_SSH_SOCKET_PATH".to_string(),
+            GUEST_SSH_SOCKET_PATH.to_string(),
         ),
         (
             "OPENSHELL_SANDBOX_COMMAND".to_string(),
@@ -895,21 +841,6 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
             child.wait().await.map(|_| ())
         }
     }
-}
-
-fn allocate_local_port() -> Result<u16, Status> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .map_err(|err| Status::internal(format!("failed to allocate local ssh port: {err}")))?;
-    listener
-        .local_addr()
-        .map(|addr| addr.port())
-        .map_err(|err| Status::internal(format!("failed to inspect local ssh port: {err}")))
-}
-
-async fn port_is_ready(port: u16) -> bool {
-    TcpStream::connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port))
-        .await
-        .is_ok()
 }
 
 async fn guest_ssh_ready(state_dir: &Path) -> bool {
@@ -1102,7 +1033,7 @@ mod tests {
         assert!(env.contains(&"OPENSHELL_ENDPOINT=http://192.168.127.1:8080/".to_string()));
         assert!(env.contains(&"OPENSHELL_SANDBOX_ID=sandbox-123".to_string()));
         assert!(env.contains(&format!(
-            "OPENSHELL_SSH_LISTEN_ADDR=0.0.0.0:{GUEST_SSH_PORT}"
+            "OPENSHELL_SSH_SOCKET_PATH={GUEST_SSH_SOCKET_PATH}"
         )));
     }
 
@@ -1354,7 +1285,6 @@ mod tests {
             sandbox_id.to_string(),
             SandboxRecord {
                 snapshot: sandbox,
-                ssh_port: 2222,
                 state_dir,
                 process,
             },

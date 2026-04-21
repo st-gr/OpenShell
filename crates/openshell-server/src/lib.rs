@@ -30,6 +30,7 @@ mod persistence;
 mod sandbox_index;
 mod sandbox_watch;
 mod ssh_tunnel;
+pub mod supervisor_session;
 mod tls;
 pub mod tracing_bus;
 mod ws_tunnel;
@@ -85,6 +86,9 @@ pub struct ServerState {
     /// set/delete operation, including the precedence check on sandbox
     /// mutations that reads global state.
     pub settings_mutex: tokio::sync::Mutex<()>,
+
+    /// Registry of active supervisor sessions and pending relay channels.
+    pub supervisor_sessions: supervisor_session::SupervisorSessionRegistry,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -115,6 +119,7 @@ impl ServerState {
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
+            supervisor_sessions: supervisor_session::SupervisorSessionRegistry::new(),
         }
     }
 }
@@ -165,6 +170,7 @@ pub async fn run_server(
 
     state.compute.spawn_watchers();
     ssh_tunnel::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
+    supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
@@ -247,8 +253,13 @@ async fn build_compute_runtime(
                 default_image: config.sandbox_image.clone(),
                 image_pull_policy: config.sandbox_image_pull_policy.clone(),
                 grpc_endpoint: config.grpc_endpoint.clone(),
-                ssh_listen_addr: format!("0.0.0.0:{}", config.sandbox_ssh_port),
-                ssh_port: config.sandbox_ssh_port,
+                // Filesystem path to the supervisor's Unix-socket SSH daemon.
+                // The path lives in a root-only directory so only the
+                // supervisor can connect; the gateway reaches it through the
+                // RelayStream bridge, not directly. Override via
+                // `sandbox_ssh_socket_path` in the config for deployments
+                // where multiple supervisors share a filesystem.
+                ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
                 ssh_handshake_secret: config.ssh_handshake_secret.clone(),
                 ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
                 client_tls_secret_name: config.client_tls_secret_name.clone(),
