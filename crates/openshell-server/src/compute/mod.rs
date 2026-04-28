@@ -5,6 +5,7 @@
 
 pub mod vm;
 
+pub use openshell_driver_docker::DockerComputeConfig;
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::{SANDBOX_SETTINGS_OBJECT_TYPE, sandbox_settings_id};
@@ -26,6 +27,7 @@ use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
     SandboxTemplate, SshSession,
 };
+use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
     ComputeDriverService, KubernetesComputeConfig, KubernetesComputeDriver,
 };
@@ -45,6 +47,45 @@ use tracing::{info, warn};
 type DriverWatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
 type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
+
+#[tonic::async_trait]
+trait ShutdownCleanup: Send + Sync {
+    async fn cleanup_on_shutdown(&self) -> Result<(), String>;
+}
+
+#[tonic::async_trait]
+impl ShutdownCleanup for DockerComputeDriver {
+    async fn cleanup_on_shutdown(&self) -> Result<(), String> {
+        let stopped = self
+            .stop_managed_containers_on_shutdown()
+            .await
+            .map_err(|err| err.to_string())?;
+        info!(
+            stopped_containers = stopped,
+            "Stopped Docker sandbox containers during gateway shutdown"
+        );
+        Ok(())
+    }
+}
+
+/// Resume a single sandbox whose store record indicates it should be
+/// running. Implemented by drivers (currently only Docker) where compute
+/// resources do not auto-restart with the gateway. Returns `Ok(true)` if
+/// the backend resource was found and resumed (or was already running),
+/// `Ok(false)` if no backend resource exists.
+#[tonic::async_trait]
+trait StartupResume: Send + Sync {
+    async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String>;
+}
+
+#[tonic::async_trait]
+impl StartupResume for DockerComputeDriver {
+    async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
+        DockerComputeDriver::resume_sandbox(self, sandbox_id, sandbox_name)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
 
 /// Interval between store-vs-backend reconciliation sweeps.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
@@ -180,6 +221,8 @@ impl ComputeDriver for RemoteComputeDriver {
 #[derive(Clone)]
 pub struct ComputeRuntime {
     driver: SharedComputeDriver,
+    shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
+    startup_resume: Option<Arc<dyn StartupResume>>,
     _driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
     store: Arc<Store>,
@@ -197,15 +240,18 @@ impl fmt::Debug for ComputeRuntime {
 }
 
 impl ComputeRuntime {
+    #[allow(clippy::too_many_arguments)]
     async fn from_driver(
         driver: SharedComputeDriver,
+        shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
+        startup_resume: Option<Arc<dyn StartupResume>>,
         driver_process: Option<Arc<ManagedDriverProcess>>,
         store: Arc<Store>,
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
-        allows_loopback_endpoints: bool,
+        _allows_loopback_endpoints: bool,
     ) -> Result<Self, ComputeError> {
         let default_image = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
@@ -215,6 +261,8 @@ impl ComputeRuntime {
             .default_image;
         Ok(Self {
             driver,
+            shutdown_cleanup,
+            startup_resume,
             _driver_process: driver_process,
             default_image,
             store,
@@ -224,6 +272,38 @@ impl ComputeRuntime {
             supervisor_sessions,
             sync_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    pub async fn new_docker(
+        config: openshell_core::Config,
+        docker_config: DockerComputeConfig,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    ) -> Result<Self, ComputeError> {
+        let driver = Arc::new(
+            DockerComputeDriver::new(&config, &docker_config, supervisor_sessions.clone())
+                .await
+                .map_err(|err| ComputeError::Message(err.to_string()))?,
+        );
+        let shutdown_cleanup: Arc<dyn ShutdownCleanup> = driver.clone();
+        let startup_resume: Arc<dyn StartupResume> = driver.clone();
+        let driver: SharedComputeDriver = driver;
+        Self::from_driver(
+            driver,
+            Some(shutdown_cleanup),
+            Some(startup_resume),
+            None,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+            true,
+        )
+        .await
     }
 
     pub async fn new_kubernetes(
@@ -240,6 +320,8 @@ impl ComputeRuntime {
         let driver: SharedComputeDriver = Arc::new(ComputeDriverService::new(driver));
         Self::from_driver(
             driver,
+            None,
+            None,
             None,
             store,
             sandbox_index,
@@ -263,6 +345,8 @@ impl ComputeRuntime {
         let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
         Self::from_driver(
             driver,
+            None,
+            None,
             driver_process,
             store,
             sandbox_index,
@@ -288,6 +372,8 @@ impl ComputeRuntime {
         let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
         Self::from_driver(
             driver,
+            None,
+            None,
             None,
             store,
             sandbox_index,
@@ -453,6 +539,142 @@ impl ComputeRuntime {
         tokio::spawn(async move {
             runtime.reconcile_loop().await;
         });
+    }
+
+    pub async fn cleanup_on_shutdown(&self) -> Result<(), String> {
+        let Some(cleanup) = &self.shutdown_cleanup else {
+            return Ok(());
+        };
+        cleanup.cleanup_on_shutdown().await
+    }
+
+    /// Resume sandboxes whose store records say they should be running.
+    /// Drivers that do not auto-restart compute resources across gateway
+    /// restarts (currently only Docker) implement `StartupResume`. For
+    /// each sandbox in the store whose phase is not `Deleting` or
+    /// `Error`, we ask the driver to resume the underlying resource. If
+    /// the driver reports that the resource no longer exists or fails to
+    /// start, the sandbox is moved to the `Error` phase so the failure
+    /// surfaces in the UI.
+    ///
+    /// Should be called once at gateway startup, before watchers spawn,
+    /// so the watch loop sees the post-resume state on its first poll.
+    pub async fn resume_persisted_sandboxes(&self) -> Result<(), String> {
+        let Some(resume) = &self.startup_resume else {
+            return Ok(());
+        };
+
+        let records = self
+            .store
+            .list(Sandbox::object_type(), 1000, 0)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut resumed = 0usize;
+        let mut missing = 0usize;
+        let mut failed = 0usize;
+
+        for record in records {
+            let sandbox = match Sandbox::decode(record.payload.as_slice()) {
+                Ok(sandbox) => sandbox,
+                Err(err) => {
+                    warn!(error = %err, "Failed to decode sandbox record during startup resume");
+                    continue;
+                }
+            };
+
+            let phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+            if !sandbox_phase_should_be_running(phase) {
+                continue;
+            }
+
+            match resume
+                .resume_sandbox(sandbox.object_id(), sandbox.object_name())
+                .await
+            {
+                Ok(true) => {
+                    info!(
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
+                        ?phase,
+                        "Resumed sandbox during gateway startup"
+                    );
+                    resumed += 1;
+                }
+                Ok(false) => {
+                    // Backend resource is gone but the store still
+                    // remembers the sandbox. Mark Error so the UI
+                    // surfaces the inconsistency; the reconcile loop
+                    // will eventually prune it after the orphan grace
+                    // period.
+                    warn!(
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
+                        "Cannot resume sandbox: backend resource is missing"
+                    );
+                    self.mark_sandbox_error(
+                        &sandbox,
+                        "BackendResourceMissing",
+                        "Sandbox container disappeared while the gateway was offline",
+                    )
+                    .await;
+                    missing += 1;
+                }
+                Err(err) => {
+                    warn!(
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
+                        error = %err,
+                        "Failed to resume sandbox during gateway startup"
+                    );
+                    self.mark_sandbox_error(
+                        &sandbox,
+                        "ResumeFailed",
+                        &format!("Failed to resume sandbox during gateway startup: {err}"),
+                    )
+                    .await;
+                    failed += 1;
+                }
+            }
+        }
+
+        if resumed > 0 || missing > 0 || failed > 0 {
+            info!(
+                resumed,
+                missing_backend = missing,
+                failed,
+                "Sandbox resume sweep complete"
+            );
+        }
+        Ok(())
+    }
+
+    async fn mark_sandbox_error(&self, sandbox: &Sandbox, reason: &str, message: &str) {
+        let _guard = self.sync_lock.lock().await;
+        let mut updated = sandbox.clone();
+        updated.phase = SandboxPhase::Error as i32;
+        let updated_name = updated.object_name().to_string();
+        upsert_ready_condition(
+            &mut updated.status,
+            &updated_name,
+            SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: reason.to_string(),
+                message: message.to_string(),
+                last_transition_time: String::new(),
+            },
+        );
+        self.sandbox_index.update_from_sandbox(&updated);
+        if let Err(err) = self.store.put_message(&updated).await {
+            warn!(
+                sandbox_id = %sandbox.object_id(),
+                error = %err,
+                "Failed to persist sandbox error state during startup resume"
+            );
+            return;
+        }
+        self.sandbox_watch_bus.notify(sandbox.object_id());
     }
 
     async fn watch_loop(self: Arc<Self>) {
@@ -978,16 +1200,68 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
         );
     }
 
-    // Pass through any non-cpu/memory resource fields from the original
-    // resources Struct so the driver can handle GPU limits, custom resources,
-    // etc. that don't map to the typed DriverResourceRequirements.
-    if let Some(ref res) = template.resources {
+    // Pass through any resource fields that do not map to the typed
+    // DriverResourceRequirements so platform-specific drivers can still see
+    // custom resources such as GPU limits.
+    if let Some(res) = build_platform_resources_config(&template.resources) {
         fields.insert(
             "resources_raw".to_string(),
             Value {
-                kind: Some(Kind::StructValue(res.clone())),
+                kind: Some(Kind::StructValue(res)),
             },
         );
+    }
+
+    if fields.is_empty() {
+        None
+    } else {
+        Some(Struct { fields })
+    }
+}
+
+fn build_platform_resources_config(
+    resources: &Option<prost_types::Struct>,
+) -> Option<prost_types::Struct> {
+    use prost_types::{Struct, Value, value::Kind};
+
+    let resources = resources.as_ref()?;
+    let mut fields = std::collections::BTreeMap::new();
+
+    for (section_name, value) in &resources.fields {
+        if !matches!(section_name.as_str(), "limits" | "requests") {
+            fields.insert(section_name.clone(), value.clone());
+            continue;
+        }
+
+        let Some(Kind::StructValue(section)) = value.kind.as_ref() else {
+            fields.insert(section_name.clone(), value.clone());
+            continue;
+        };
+
+        let section_fields = section
+            .fields
+            .iter()
+            .filter_map(|(resource_name, resource_value)| {
+                let is_typed_quantity = matches!(resource_name.as_str(), "cpu" | "memory")
+                    && matches!(resource_value.kind.as_ref(), Some(Kind::StringValue(_)));
+                if is_typed_quantity {
+                    None
+                } else {
+                    Some((resource_name.clone(), resource_value.clone()))
+                }
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        if !section_fields.is_empty() {
+            fields.insert(
+                section_name.clone(),
+                Value {
+                    kind: Some(Kind::StructValue(Struct {
+                        fields: section_fields,
+                    })),
+                },
+            );
+        }
     }
 
     if fields.is_empty() {
@@ -1181,6 +1455,17 @@ fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Opti
     }
 }
 
+/// Phases for which a sandbox should have a running compute resource.
+/// `Deleting` and `Error` are intentionally excluded: deletion is in
+/// progress, or the sandbox has already failed and should not be
+/// silently revived.
+fn sandbox_phase_should_be_running(phase: SandboxPhase) -> bool {
+    matches!(
+        phase,
+        SandboxPhase::Provisioning | SandboxPhase::Ready | SandboxPhase::Unknown
+    )
+}
+
 fn is_terminal_failure_reason(reason: &str) -> bool {
     let reason = reason.to_ascii_lowercase();
     let transient_reasons = [
@@ -1204,6 +1489,31 @@ mod tests {
     };
     use std::sync::Arc;
     use tokio::sync::{mpsc, oneshot};
+
+    fn string_value(value: &str) -> prost_types::Value {
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(value.to_string())),
+        }
+    }
+
+    fn number_value(value: f64) -> prost_types::Value {
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::NumberValue(value)),
+        }
+    }
+
+    fn struct_value(
+        fields: impl IntoIterator<Item = (impl Into<String>, prost_types::Value)>,
+    ) -> prost_types::Value {
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
+                fields: fields
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value))
+                    .collect(),
+            })),
+        }
+    }
 
     #[derive(Debug, Default)]
     struct TestDriver {
@@ -1310,9 +1620,18 @@ mod tests {
     }
 
     async fn test_runtime(driver: SharedComputeDriver) -> ComputeRuntime {
+        test_runtime_with_resume(driver, None).await
+    }
+
+    async fn test_runtime_with_resume(
+        driver: SharedComputeDriver,
+        startup_resume: Option<Arc<dyn StartupResume>>,
+    ) -> ComputeRuntime {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
             driver,
+            shutdown_cleanup: None,
+            startup_resume,
             _driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
             store,
@@ -1476,6 +1795,123 @@ mod tests {
         };
 
         assert_eq!(derive_phase(Some(&status)), SandboxPhase::Ready);
+    }
+
+    #[test]
+    fn build_platform_config_omits_typed_cpu_and_memory_resources() {
+        let template = SandboxTemplate {
+            resources: Some(prost_types::Struct {
+                fields: [
+                    (
+                        "limits",
+                        struct_value([("cpu", string_value("2")), ("memory", string_value("1Gi"))]),
+                    ),
+                    (
+                        "requests",
+                        struct_value([
+                            ("cpu", string_value("500m")),
+                            ("memory", string_value("512Mi")),
+                        ]),
+                    ),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+            }),
+            ..Default::default()
+        };
+
+        assert!(build_platform_config(&template).is_none());
+    }
+
+    #[test]
+    fn build_platform_config_preserves_non_typed_resource_fields() {
+        let template = SandboxTemplate {
+            resources: Some(prost_types::Struct {
+                fields: [
+                    (
+                        "limits",
+                        struct_value([
+                            ("cpu", string_value("2")),
+                            ("memory", string_value("1Gi")),
+                            ("nvidia.com/gpu", string_value("1")),
+                        ]),
+                    ),
+                    (
+                        "requests",
+                        struct_value([
+                            ("cpu", string_value("500m")),
+                            ("memory", string_value("512Mi")),
+                            ("hugepages-2Mi", string_value("4Mi")),
+                        ]),
+                    ),
+                    ("opaque_cpu", number_value(2.0)),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+            }),
+            ..Default::default()
+        };
+
+        let platform_config = build_platform_config(&template).unwrap();
+        let resources_raw = platform_config
+            .fields
+            .get("resources_raw")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StructValue(inner) => Some(inner),
+                _ => None,
+            })
+            .unwrap();
+
+        let limits = resources_raw
+            .fields
+            .get("limits")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StructValue(inner) => Some(inner),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!limits.fields.contains_key("cpu"));
+        assert!(!limits.fields.contains_key("memory"));
+        assert_eq!(
+            limits
+                .fields
+                .get("nvidia.com/gpu")
+                .and_then(|value| value.kind.as_ref())
+                .and_then(|kind| match kind {
+                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                    _ => None,
+                }),
+            Some("1")
+        );
+
+        let requests = resources_raw
+            .fields
+            .get("requests")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StructValue(inner) => Some(inner),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!requests.fields.contains_key("cpu"));
+        assert!(!requests.fields.contains_key("memory"));
+        assert_eq!(
+            requests
+                .fields
+                .get("hugepages-2Mi")
+                .and_then(|value| value.kind.as_ref())
+                .and_then(|kind| match kind {
+                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                    _ => None,
+                }),
+            Some("4Mi")
+        );
+
+        assert!(resources_raw.fields.contains_key("opaque_cpu"));
     }
 
     #[test]
@@ -1909,5 +2345,163 @@ mod tests {
             watch_rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Closed)
         ));
+    }
+
+    #[derive(Default)]
+    struct RecordingResume {
+        calls: tokio::sync::Mutex<Vec<(String, String)>>,
+        results: tokio::sync::Mutex<std::collections::HashMap<String, Result<bool, String>>>,
+    }
+
+    impl RecordingResume {
+        async fn set_result(&self, sandbox_id: &str, result: Result<bool, String>) {
+            self.results
+                .lock()
+                .await
+                .insert(sandbox_id.to_string(), result);
+        }
+
+        async fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().await.clone()
+        }
+    }
+
+    #[tonic::async_trait]
+    impl StartupResume for RecordingResume {
+        async fn resume_sandbox(
+            &self,
+            sandbox_id: &str,
+            sandbox_name: &str,
+        ) -> Result<bool, String> {
+            self.calls
+                .lock()
+                .await
+                .push((sandbox_id.to_string(), sandbox_name.to_string()));
+            self.results
+                .lock()
+                .await
+                .get(sandbox_id)
+                .cloned()
+                .unwrap_or(Ok(true))
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_persisted_sandboxes_resumes_running_phases() {
+        let resume = Arc::new(RecordingResume::default());
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+
+        for (id, name, phase) in [
+            ("sb-prov", "prov", SandboxPhase::Provisioning),
+            ("sb-ready", "ready", SandboxPhase::Ready),
+            ("sb-unknown", "unknown", SandboxPhase::Unknown),
+            ("sb-deleting", "deleting", SandboxPhase::Deleting),
+            ("sb-error", "error", SandboxPhase::Error),
+        ] {
+            let sandbox = sandbox_record(id, name, phase);
+            runtime.store.put_message(&sandbox).await.unwrap();
+        }
+
+        runtime.resume_persisted_sandboxes().await.unwrap();
+
+        let mut called_ids = resume
+            .calls()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        called_ids.sort();
+        assert_eq!(
+            called_ids,
+            vec![
+                "sb-prov".to_string(),
+                "sb-ready".to_string(),
+                "sb-unknown".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_persisted_sandboxes_marks_missing_backend_as_error() {
+        let resume = Arc::new(RecordingResume::default());
+        resume.set_result("sb-1", Ok(false)).await;
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+
+        let sandbox = sandbox_record("sb-1", "missing", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.resume_persisted_sandboxes().await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Error
+        );
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.iter().find(|c| c.r#type == "Ready"))
+            .expect("Ready condition present");
+        assert_eq!(ready.reason, "BackendResourceMissing");
+    }
+
+    #[tokio::test]
+    async fn resume_persisted_sandboxes_marks_failed_resume_as_error() {
+        let resume = Arc::new(RecordingResume::default());
+        resume
+            .set_result("sb-1", Err("docker daemon angry".to_string()))
+            .await;
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+
+        let sandbox = sandbox_record("sb-1", "broken", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.resume_persisted_sandboxes().await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Error
+        );
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.iter().find(|c| c.r#type == "Ready"))
+            .expect("Ready condition present");
+        assert_eq!(ready.reason, "ResumeFailed");
+        assert!(ready.message.contains("docker daemon angry"));
+    }
+
+    #[tokio::test]
+    async fn resume_persisted_sandboxes_is_noop_without_resume_hook() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "anywhere", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.resume_persisted_sandboxes().await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Ready
+        );
     }
 }
