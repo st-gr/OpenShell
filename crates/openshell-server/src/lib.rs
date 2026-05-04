@@ -156,6 +156,15 @@ pub async fn run_server(
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
+    let driver = configured_compute_driver(&config)?;
+    if config.ssh_handshake_secret.is_empty()
+        && !matches!(driver, ComputeDriverKind::Docker | ComputeDriverKind::Vm)
+    {
+        return Err(Error::config(
+            "ssh_handshake_secret is required. Set --ssh-handshake-secret or OPENSHELL_SSH_HANDSHAKE_SECRET",
+        ));
+    }
+
     let store = Arc::new(Store::connect(database_url).await?);
 
     let oidc_cache = if let Some(ref oidc) = config.oidc {
