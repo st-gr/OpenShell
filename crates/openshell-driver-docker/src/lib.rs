@@ -231,7 +231,9 @@ impl DockerComputeDriver {
         }
         let network_name = docker_network_name(docker_config);
         let bridge_gateway_ip = ensure_bridge_network(&docker, &network_name).await?;
-        let gateway_route = docker_gateway_route(&info, bridge_gateway_ip, gateway_port);
+        let host_gateway_ip = parse_optional_host_gateway_ip(&config.host_gateway_ip)?;
+        let gateway_route =
+            docker_gateway_route(&info, bridge_gateway_ip, gateway_port, host_gateway_ip);
         let grpc_endpoint = docker_container_openshell_endpoint(
             &config.grpc_endpoint,
             HOST_OPENSHELL_INTERNAL,
@@ -797,11 +799,21 @@ impl ComputeDriver for DockerComputeDriver {
         let request = request.into_inner();
         require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
 
-        Ok(Response::new(DeleteSandboxResponse {
-            deleted: self
-                .delete_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
-                .await?,
-        }))
+        let event_sandbox_id = request.sandbox_id.clone();
+        let deleted = self
+            .delete_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
+            .await?;
+        if deleted && !event_sandbox_id.is_empty() {
+            let _ = self.events.send(WatchSandboxesEvent {
+                payload: Some(watch_sandboxes_event::Payload::Deleted(
+                    WatchSandboxesDeletedEvent {
+                        sandbox_id: event_sandbox_id,
+                    },
+                )),
+            });
+        }
+
+        Ok(Response::new(DeleteSandboxResponse { deleted }))
     }
 
     async fn watch_sandboxes(
@@ -1064,11 +1076,32 @@ fn docker_network_name(config: &DockerComputeConfig) -> String {
     name.to_string()
 }
 
+fn parse_optional_host_gateway_ip(value: &str) -> CoreResult<Option<IpAddr>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    trimmed.parse().map(Some).map_err(|err| {
+        Error::config(format!(
+            "invalid OPENSHELL_HOST_GATEWAY_IP value '{trimmed}': {err}"
+        ))
+    })
+}
+
 fn docker_gateway_route(
     info: &SystemInfo,
     bridge_gateway_ip: IpAddr,
     port: u16,
+    host_gateway_ip: Option<IpAddr>,
 ) -> DockerGatewayRoute {
+    if let Some(host_alias_ip) = host_gateway_ip {
+        return DockerGatewayRoute::Bridge {
+            bind_address: SocketAddr::new(host_alias_ip, port),
+            host_alias_ip,
+        };
+    }
+
     if is_docker_desktop(info) {
         DockerGatewayRoute::HostGateway
     } else {
