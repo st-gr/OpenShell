@@ -772,6 +772,9 @@ jobs:
             openshell-x86_64-unknown-linux-musl.tar.gz \
             openshell-aarch64-unknown-linux-musl.tar.gz \
             openshell-aarch64-apple-darwin.tar.gz \
+            openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz \
+            openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz \
+            openshell-driver-vm-aarch64-apple-darwin.tar.gz \
             openshell_*.deb \
             openshell-*.rpm \
             *.whl > openshell-checksums-sha256.txt
@@ -785,6 +788,15 @@ jobs:
             openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz \
             openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz > openshell-sandbox-checksums-sha256.txt
           cat openshell-sandbox-checksums-sha256.txt
+
+      - name: Generate Homebrew formula
+        run: |
+          set -euo pipefail
+          python3 tasks/scripts/release.py generate-homebrew-formula \
+            --release-tag "${RELEASE_TAG}" \
+            --release-dir release \
+            --output release/openshell.rb
+          cat release/openshell.rb
 
       - name: Attest VM driver artifacts
         uses: actions/attest@v4
@@ -847,6 +859,7 @@ jobs:
             release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
             release/*.whl
+            release/openshell.rb
             release/openshell-checksums-sha256.txt
             release/openshell-gateway-checksums-sha256.txt
             release/openshell-sandbox-checksums-sha256.txt
