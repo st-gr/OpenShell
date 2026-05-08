@@ -214,6 +214,11 @@ def _asset_url(release_tag: str, filename: str) -> str:
     return f"{GITHUB_RELEASE_DOWNLOADS}/{release_tag}/{filename}"
 
 
+def _homebrew_supervisor_image(release_tag: str) -> str:
+    image_tag = "dev" if release_tag == "dev" else release_tag.removeprefix("v")
+    return f"ghcr.io/nvidia/openshell/supervisor:{image_tag}"
+
+
 def render_homebrew_formula(
     *,
     release_tag: str,
@@ -225,6 +230,7 @@ def render_homebrew_formula(
         raise ValueError(f"release tag contains unsupported characters: {release_tag}")
 
     version = release_tag.removeprefix("v")
+    docker_supervisor_image = _homebrew_supervisor_image(release_tag)
     return f"""# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -263,12 +269,37 @@ class Openshell < Formula
     resource("openshell-driver-vm").stage do
       libexec.install "openshell-driver-vm"
     end
+
+    (libexec/"openshell-gateway-homebrew-service").write <<~SH
+      #!/bin/sh
+      set -eu
+
+      if [ -z "${{HOME:-}}" ]; then
+        echo "HOME must be set for Docker TLS bind mounts" >&2
+        exit 1
+      fi
+
+      docker_tls_dir="${{OPENSHELL_DOCKER_TLS_DIR:-${{HOME}}/.local/state/openshell/homebrew/tls}}"
+      mkdir -p "${{docker_tls_dir}}/client"
+      chmod 700 "${{docker_tls_dir}}" "${{docker_tls_dir}}/client"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/ca.crt" "${{docker_tls_dir}}/ca.crt"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/client/tls.crt" "${{docker_tls_dir}}/client/tls.crt"
+      /usr/bin/install -m 0600 "#{{var}}/openshell/tls/client/tls.key" "${{docker_tls_dir}}/client/tls.key"
+
+      export OPENSHELL_DOCKER_TLS_CA="${{docker_tls_dir}}/ca.crt"
+      export OPENSHELL_DOCKER_TLS_CERT="${{docker_tls_dir}}/client/tls.crt"
+      export OPENSHELL_DOCKER_TLS_KEY="${{docker_tls_dir}}/client/tls.key"
+
+      exec "#{{opt_bin}}/openshell-gateway"
+    SH
+    chmod 0755, libexec/"openshell-gateway-homebrew-service"
   end
 
   def post_install
     (var/"openshell/gateway").mkpath
     (var/"openshell/vm-driver").mkpath
     (var/"log/openshell").mkpath
+    system bin/"openshell-gateway", "generate-certs", "--output-dir", var/"openshell/tls", "--server-san", "host.openshell.internal"
 
     entitlements = var/"openshell/openshell-driver-vm.entitlements.plist"
     entitlements.atomic_write <<~XML
@@ -286,17 +317,25 @@ class Openshell < Formula
   end
 
   service do
-    run opt_bin/"openshell-gateway"
+    run opt_libexec/"openshell-gateway-homebrew-service"
     environment_variables(
       OPENSHELL_BIND_ADDRESS: "127.0.0.1",
       OPENSHELL_SERVER_PORT: "{LOCAL_GATEWAY_PORT}",
-      OPENSHELL_DISABLE_TLS: "true",
-      OPENSHELL_DISABLE_GATEWAY_AUTH: "true",
+      OPENSHELL_TLS_CERT: "#{{var}}/openshell/tls/server/tls.crt",
+      OPENSHELL_TLS_KEY: "#{{var}}/openshell/tls/server/tls.key",
+      OPENSHELL_TLS_CLIENT_CA: "#{{var}}/openshell/tls/ca.crt",
       OPENSHELL_DB_URL: "sqlite:#{{var}}/openshell/gateway/openshell.db",
-      OPENSHELL_GRPC_ENDPOINT: "http://127.0.0.1:{LOCAL_GATEWAY_PORT}",
+      OPENSHELL_GRPC_ENDPOINT: "https://127.0.0.1:{LOCAL_GATEWAY_PORT}",
       OPENSHELL_SSH_GATEWAY_HOST: "127.0.0.1",
       OPENSHELL_SSH_GATEWAY_PORT: "{LOCAL_GATEWAY_PORT}",
       OPENSHELL_VM_DRIVER_STATE_DIR: "#{{var}}/openshell/vm-driver",
+      OPENSHELL_VM_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
+      OPENSHELL_VM_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
+      OPENSHELL_VM_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
+      OPENSHELL_DOCKER_SUPERVISOR_IMAGE: "{docker_supervisor_image}",
+      OPENSHELL_PODMAN_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
+      OPENSHELL_PODMAN_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
+      OPENSHELL_PODMAN_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
       OPENSHELL_DRIVER_DIR: "#{{opt_libexec}}",
     )
     keep_alive successful_exit: false
@@ -310,7 +349,7 @@ class Openshell < Formula
         brew services restart openshell
 
       Register it with the OpenShell CLI:
-        openshell gateway add http://127.0.0.1:{LOCAL_GATEWAY_PORT} --local --name local
+        openshell gateway add https://127.0.0.1:{LOCAL_GATEWAY_PORT} --local --name openshell
     EOS
   end
 
