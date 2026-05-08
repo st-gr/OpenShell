@@ -20,12 +20,16 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 MONITORING_NAMESPACE="${MONITORING_NAMESPACE:-monitoring}"
 OBSERVABILITY_NAMESPACE="${OBSERVABILITY_NAMESPACE:-observability}"
 PROMSTACK_RELEASE="${PROMSTACK_RELEASE:-kube-prometheus-stack}"
 PROMSTACK_VERSION="${PROMSTACK_VERSION:-75.0.0}"
+PROMSTACK_VALUES="${PROMSTACK_VALUES:-${SCRIPT_DIR}/observability-prometheus-values.yaml}"
 JAEGER_RELEASE="${JAEGER_RELEASE:-jaeger}"
 JAEGER_VERSION="${JAEGER_VERSION:-3.4.0}"
+JAEGER_VALUES="${JAEGER_VALUES:-${SCRIPT_DIR}/observability-jaeger-values.yaml}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
 
 # ---------------------------------------------------------------------------
@@ -51,11 +55,7 @@ helm upgrade --install "${PROMSTACK_RELEASE}" prometheus-community/kube-promethe
     --version "${PROMSTACK_VERSION}" \
     --namespace "${MONITORING_NAMESPACE}" \
     --create-namespace \
-    --set alertmanager.enabled=false \
-    --set nodeExporter.enabled=false \
-    --set kubeStateMetrics.enabled=false \
-    --set grafana.adminPassword=admin \
-    --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
+    --values "${PROMSTACK_VALUES}" \
     --wait --timeout "${HEALTH_TIMEOUT}s"
 
 # ---------------------------------------------------------------------------
@@ -67,12 +67,7 @@ helm upgrade --install "${JAEGER_RELEASE}" jaegertracing/jaeger \
     --version "${JAEGER_VERSION}" \
     --namespace "${OBSERVABILITY_NAMESPACE}" \
     --create-namespace \
-    --set allInOne.enabled=true \
-    --set storage.type=memory \
-    --set provisionDataStore.cassandra=false \
-    --set agent.enabled=false \
-    --set collector.enabled=false \
-    --set query.enabled=false \
+    --values "${JAEGER_VALUES}" \
     --wait --timeout "${HEALTH_TIMEOUT}s"
 
 # ---------------------------------------------------------------------------

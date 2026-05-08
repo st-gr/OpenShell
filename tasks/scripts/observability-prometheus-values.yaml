@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helm values for the local-dev kube-prometheus-stack install.
+# Consumed by tasks/scripts/observability-k8s-setup.sh.
+#
+# Slimmed down for k3d: drops Alertmanager + node/kube-state exporters.
+# Real-cluster operators install the bundle separately and follow the
+# docs/kubernetes/monitoring.mdx guide.
+
+alertmanager:
+  enabled: false
+nodeExporter:
+  enabled: false
+kubeStateMetrics:
+  enabled: false
+
+prometheus:
+  prometheusSpec:
+    # Don't restrict to ServiceMonitors carrying the Helm release label —
+    # the openshell chart sets its own selector via monitoring.serviceMonitor.labels.
+    serviceMonitorSelectorNilUsesHelmValues: false
+
+grafana:
+  adminPassword: admin
+  # Auto-provision Jaeger as a trace datasource. The Prometheus datasource is
+  # added by the chart automatically.
+  additionalDataSources:
+    - name: Jaeger
+      uid: jaeger
+      type: jaeger
+      access: proxy
+      # Service installed by tasks/scripts/observability-jaeger-values.yaml.
+      url: http://jaeger-query.observability.svc.cluster.local:16686
+      editable: true

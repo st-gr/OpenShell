@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helm values for the local-dev jaegertracing/jaeger install.
+# Consumed by tasks/scripts/observability-k8s-setup.sh.
+#
+# All-in-one mode: single pod with in-memory storage, OTLP/gRPC receiver on
+# :4317, OTLP/HTTP on :4318, UI on :16686. Enough for dashboards and trace
+# inspection during dev; nothing persists across pod restarts.
+
+allInOne:
+  enabled: true
+
+storage:
+  type: memory
+
+provisionDataStore:
+  cassandra: false
+
+agent:
+  enabled: false
+collector:
+  enabled: false
+query:
+  enabled: false
