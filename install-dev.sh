@@ -227,26 +227,10 @@ find_deb_asset() {
   _arch="$2"
 
   awk -v arch="$_arch" '
-    {
-      name = $2
-      sub("^\\*", "", name)
-
-      if (name == "openshell-dev-" arch ".deb") {
-        selected = name
-        found = 1
-        exit
-      }
-
-      if (fallback == "" && name ~ "^openshell_.*_" arch "\\.deb$") {
-        fallback = name
-      }
-    }
-    END {
-      if (found) {
-        print selected
-      } else if (fallback != "") {
-        print fallback
-      }
+    $2 ~ "^\\*?openshell[-_].*[-_]" arch "\\.deb$" {
+      sub("^\\*", "", $2)
+      print $2
+      exit
     }
   ' "$_checksums"
 }
@@ -313,6 +297,19 @@ patch_homebrew_formula() {
     sed 's/entitlements\.write <<~XML/entitlements.atomic_write <<~XML/' "$_formula_file" >"$_patched_file"
     mv "$_patched_file" "$_formula_file"
   fi
+
+  if ! grep -q 'OPENSHELL_DRIVERS:' "$_formula_file"; then
+    info "patching Homebrew formula to use VM driver..."
+    awk '
+      {
+        print
+        if ($0 ~ /^[[:space:]]*environment_variables\(/) {
+          print "      OPENSHELL_DRIVERS: \"vm\","
+        }
+      }
+    ' "$_formula_file" >"$_patched_file"
+    mv "$_patched_file" "$_formula_file"
+  fi
 }
 
 start_user_gateway() {
@@ -329,8 +326,54 @@ start_user_gateway() {
   as_target_user systemctl --user restart openshell-gateway
   as_target_user systemctl --user is-active --quiet openshell-gateway
 
+  wait_for_local_gateway_listener
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
+  wait_for_local_gateway_status
+}
+
+wait_for_local_gateway_listener() {
+  _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
+  _elapsed=0
+  _last_output=""
+  _probe_url="http://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+
+  info "waiting for local gateway listener to become reachable..."
+  while [ "$_elapsed" -lt "$_timeout" ]; do
+    if _last_output="$(as_target_user curl -sS --max-time 2 -o /dev/null "$_probe_url" 2>&1)"; then
+      info "local gateway listener is reachable"
+      return 0
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+
+  printf '%s\n' "$_last_output" >&2
+  error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
+}
+
+wait_for_local_gateway_status() {
+  _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
+  _elapsed=0
+  _status_output=""
+  _register_bin="${OPENSHELL_REGISTER_BIN:-openshell}"
+
+  info "waiting for openshell status to report connected..."
+  while [ "$_elapsed" -lt "$_timeout" ]; do
+    if _status_output="$(as_target_user env NO_COLOR=1 "$_register_bin" status 2>&1)"; then
+      case "$_status_output" in
+        *"Version:"*)
+          info "openshell status reports connected"
+          return 0
+          ;;
+      esac
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+
+  printf '%s\n' "$_status_output" >&2
+  error "openshell status did not report connected within ${_timeout}s"
 }
 
 remove_local_gateway_registration() {
@@ -354,7 +397,7 @@ register_local_gateway() {
   _register_bin="${OPENSHELL_REGISTER_BIN:-openshell}"
 
   if _add_output="$(as_target_user "$_register_bin" gateway add "http://127.0.0.1:${LOCAL_GATEWAY_PORT}" --local --name local 2>&1)"; then
-    [ -z "$_add_output" ] || printf '%s\n' "$_add_output" >&2
+    [ -z "$_add_output" ] || print_gateway_add_output "$_add_output"
     return 0
   else
     _add_status=$?
@@ -371,6 +414,16 @@ register_local_gateway() {
       return "$_add_status"
       ;;
   esac
+}
+
+print_gateway_add_output() {
+  printf '%s\n' "$1" | while IFS= read -r _line; do
+    case "$_line" in
+      *"Gateway is not reachable at http://127.0.0.1:${LOCAL_GATEWAY_PORT}"*) ;;
+      *"Verify the gateway is running and the endpoint is correct."*) ;;
+      *) printf '%s\n' "$_line" >&2 ;;
+    esac
+  done
 }
 
 install_linux_deb() {
@@ -466,8 +519,10 @@ install_macos_homebrew() {
     OPENSHELL_REGISTER_BIN="${_brew_prefix}/bin/openshell"
   fi
 
+  wait_for_local_gateway_listener
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
+  wait_for_local_gateway_status
 }
 
 main() {
