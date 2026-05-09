@@ -220,7 +220,7 @@ detect_platform() {
 }
 
 is_ostree_system() {
-  [ "${OPENSHELL_TEST_OSTREE_BOOTED:-}" = "1" ] || [ -e /run/ostree-booted ]
+  [ -e /run/ostree-booted ]
 }
 
 linux_package_method() {
@@ -429,63 +429,54 @@ extract_rpm_payload() {
   )
 }
 
-supervisor_image_tag() {
-  case "$RELEASE_TAG" in
-    dev)
-      echo "dev"
-      ;;
-    *)
-      echo "latest"
-      ;;
-  esac
-}
+stage_ostree_gateway_unit() {
+  _src_unit="$1"
+  _dst_unit="$2"
+  _gateway_bin="$3"
+  _init_pki="$4"
+  _init_gateway_env="$5"
 
-write_ostree_gateway_unit() {
-  _unit_file="$1"
-  _gateway_bin="$2"
-  _init_pki="$3"
-  _init_gateway_env="$4"
-  _supervisor_tag="$(supervisor_image_tag)"
+  [ -e "$_src_unit" ] || error "expected systemd user unit not found in RPM payload: ${_src_unit}"
+  # Reuse the packaged RPM user unit and patch only the relocation details that
+  # differ for the ostree user-local install path.
+  if ! awk \
+    -v gateway_bin="$_gateway_bin" \
+    -v init_pki="$_init_pki" \
+    -v init_gateway_env="$_init_gateway_env" \
+    -v local_port="$LOCAL_GATEWAY_PORT" '
+      /^Environment=OPENSHELL_SERVER_PORT=/ ||
+      /^Environment=OPENSHELL_SSH_GATEWAY_HOST=/ ||
+      /^Environment=OPENSHELL_SSH_GATEWAY_PORT=/ {
+        next
+      }
 
-  cat >"$_unit_file" <<EOF
-[Unit]
-Description=OpenShell Gateway (user)
-Documentation=https://github.com/NVIDIA/OpenShell
-After=podman.socket
-Requires=podman.socket
+      {
+        gsub("/usr/bin/openshell-gateway", gateway_bin)
+        gsub("/usr/libexec/openshell/init-pki.sh", init_pki)
+        gsub("/usr/libexec/openshell/init-gateway-env.sh", init_gateway_env)
+      }
 
-[Service]
-Type=exec
-ExecStartPre=${_init_pki} %S/openshell/tls
-ExecStartPre=${_init_gateway_env} %E/openshell/gateway.env
-EnvironmentFile=-%E/openshell/gateway.env
-Environment=OPENSHELL_BIND_ADDRESS=127.0.0.1
-Environment=OPENSHELL_SERVER_PORT=${LOCAL_GATEWAY_PORT}
-Environment=OPENSHELL_DRIVERS=podman
-Environment=OPENSHELL_DB_URL=sqlite://%S/openshell/gateway.db
-Environment=OPENSHELL_GRPC_ENDPOINT=https://127.0.0.1:${LOCAL_GATEWAY_PORT}
-Environment=OPENSHELL_SSH_GATEWAY_HOST=127.0.0.1
-Environment=OPENSHELL_SSH_GATEWAY_PORT=${LOCAL_GATEWAY_PORT}
-Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:${_supervisor_tag}
-Environment=OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
-Environment=OPENSHELL_TLS_CERT=%S/openshell/tls/server/tls.crt
-Environment=OPENSHELL_TLS_KEY=%S/openshell/tls/server/tls.key
-Environment=OPENSHELL_TLS_CLIENT_CA=%S/openshell/tls/ca.crt
-Environment=OPENSHELL_PODMAN_TLS_CA=%S/openshell/tls/ca.crt
-Environment=OPENSHELL_PODMAN_TLS_CERT=%S/openshell/tls/client/tls.crt
-Environment=OPENSHELL_PODMAN_TLS_KEY=%S/openshell/tls/client/tls.key
-ExecStart=${_gateway_bin}
-StateDirectory=openshell
-Restart=on-failure
-RestartSec=5
-NoNewPrivileges=yes
-ProtectSystem=strict
-PrivateTmp=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+      /^Environment=OPENSHELL_BIND_ADDRESS=/ {
+        patched_bind = 1
+        print "Environment=OPENSHELL_BIND_ADDRESS=127.0.0.1"
+        print "Environment=OPENSHELL_SERVER_PORT=" local_port
+        print "Environment=OPENSHELL_SSH_GATEWAY_HOST=127.0.0.1"
+        print "Environment=OPENSHELL_SSH_GATEWAY_PORT=" local_port
+        next
+      }
 
-[Install]
-WantedBy=default.target
-EOF
+      {
+        print
+      }
+
+      END {
+        if (!patched_bind) {
+          exit 42
+        }
+      }
+    ' "$_src_unit" >"$_dst_unit"; then
+    error "failed to stage ostree systemd unit from RPM payload: ${_src_unit}"
+  fi
 }
 
 install_ostree_file() {
@@ -533,7 +524,8 @@ install_ostree_payload_files() {
   install_ostree_file "${_gateway_root}/usr/libexec/openshell/init-gateway-env.sh" "${_local_libexec}/init-gateway-env.sh" 0755
 
   _staged_unit="${_tmpdir}/openshell-gateway.service"
-  write_ostree_gateway_unit \
+  stage_ostree_gateway_unit \
+    "${_gateway_root}/usr/lib/systemd/user/openshell-gateway.service" \
     "$_staged_unit" \
     "${_local_bin}/openshell-gateway" \
     "${_local_libexec}/init-pki.sh" \
@@ -920,6 +912,4 @@ main() {
   esac
 }
 
-if [ "${OPENSHELL_INSTALL_SOURCE_ONLY:-}" != "1" ]; then
-  main "$@"
-fi
+main "$@"
