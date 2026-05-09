@@ -15,12 +15,14 @@ pub mod log_push;
 pub mod mechanistic_mapper;
 pub mod opa;
 mod policy;
+mod policy_local;
 mod process;
 pub mod procfs;
 mod provider_credentials;
 pub mod proxy;
 mod sandbox;
 mod secrets;
+mod skills;
 mod ssh;
 mod supervisor_session;
 
@@ -86,6 +88,83 @@ static OCSF_CTX_FALLBACK: LazyLock<SandboxContext> = LazyLock::new(|| SandboxCon
 /// (e.g. during unit tests).
 pub(crate) fn ocsf_ctx() -> &'static SandboxContext {
     OCSF_CTX.get().unwrap_or(&OCSF_CTX_FALLBACK)
+}
+
+/// Process-wide flag for the agent-driven policy proposal surface.
+/// Set once during `run_sandbox()` startup and updated by the settings poll
+/// loop when `agent_policy_proposals_enabled` changes. Read by the
+/// `policy.local` route handler and the L7 deny body's `next_steps` builder
+/// to gate the agent-controlled mutation surface. Exposed `pub(crate)` so
+/// unit tests in sibling modules can flip the flag through a serialized
+/// guard (see `policy_local::tests::ProposalsFlagGuard`).
+pub(crate) static AGENT_PROPOSALS_ENABLED: OnceLock<Arc<std::sync::atomic::AtomicBool>> =
+    OnceLock::new();
+
+/// Read the current value of the agent proposals feature flag.
+///
+/// Returns `false` if `run_sandbox()` has not initialized the flag (e.g.
+/// during unit tests), matching the documented default for the setting.
+pub(crate) fn agent_proposals_enabled() -> bool {
+    AGENT_PROPOSALS_ENABLED
+        .get()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+/// Test-only helpers shared across sibling test modules.
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    #![allow(
+        clippy::redundant_pub_crate,
+        reason = "intentional crate-private module"
+    )]
+    use std::sync::Arc;
+    use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::MutexGuard;
+
+    static PROPOSALS_FLAG_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// Guard for tests that toggle the process-wide
+    /// `AGENT_PROPOSALS_ENABLED` flag. Acquires a process-wide async mutex,
+    /// swaps in the requested value, and restores the previous value on drop.
+    /// Hold the guard for the duration of any code that reads
+    /// `agent_proposals_enabled()`.
+    pub(crate) struct ProposalsFlagGuard {
+        prev: bool,
+        flag: Arc<AtomicBool>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl ProposalsFlagGuard {
+        pub(crate) async fn set(enabled: bool) -> Self {
+            let lock = PROPOSALS_FLAG_LOCK.lock().await;
+            Self::with_lock(enabled, lock)
+        }
+
+        pub(crate) fn set_blocking(enabled: bool) -> Self {
+            let lock = PROPOSALS_FLAG_LOCK.blocking_lock();
+            Self::with_lock(enabled, lock)
+        }
+
+        fn with_lock(enabled: bool, lock: MutexGuard<'static, ()>) -> Self {
+            let flag = super::AGENT_PROPOSALS_ENABLED
+                .get_or_init(|| Arc::new(AtomicBool::new(false)))
+                .clone();
+            let prev = flag.swap(enabled, Ordering::Relaxed);
+            Self {
+                prev,
+                flag,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ProposalsFlagGuard {
+        fn drop(&mut self) {
+            self.flag.store(self.prev, Ordering::Relaxed);
+        }
+    }
 }
 
 use crate::identity::BinaryIdentityCache;
@@ -260,6 +339,11 @@ pub async fn run_sandbox(
         policy_data,
     )
     .await?;
+    let policy_local_ctx = Arc::new(policy_local::PolicyLocalContext::new(
+        retained_proto.clone(),
+        openshell_endpoint.clone(),
+        sandbox_name_for_agg.clone().or_else(|| sandbox_id.clone()),
+    ));
 
     // Validate that the required "sandbox" user exists in this image.
     // All sandbox images must include this user for privilege dropping.
@@ -317,6 +401,49 @@ pub async fn run_sandbox(
 
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
+
+    // Initialize the agent-proposals feature flag. Default false until the
+    // initial settings fetch (or the poll loop) tells us otherwise. The flag
+    // gates the skill install, the policy.local route handler, and the L7
+    // deny body's `next_steps` field — see `agent_proposals_enabled()`.
+    let proposals_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if AGENT_PROPOSALS_ENABLED
+        .set(proposals_enabled.clone())
+        .is_err()
+    {
+        debug!("agent proposals flag already initialized, keeping existing");
+    }
+
+    // Eagerly fetch the initial settings so skill install can honor the flag
+    // at startup rather than waiting for the poll loop's first tick. In
+    // offline/file-mode there is no gateway, so the flag stays false.
+    if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint)
+        && let Ok(client) = grpc_client::CachedOpenShellClient::connect(endpoint).await
+        && let Ok(result) = client.poll_settings(id).await
+    {
+        let initial = extract_bool_setting(
+            &result.settings,
+            openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY,
+        )
+        .unwrap_or(false);
+        proposals_enabled.store(initial, Ordering::Relaxed);
+    }
+
+    if agent_proposals_enabled() {
+        match skills::install_static_skills() {
+            Ok(installed) => {
+                info!(
+                    path = %installed.policy_advisor.display(),
+                    "Installed sandbox agent skill"
+                );
+            }
+            Err(error) => {
+                warn!(error = %error, "Failed to install sandbox agent skill");
+            }
+        }
+    } else {
+        debug!("agent_policy_proposals_enabled is false at startup; skipping skill install");
+    }
 
     // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
     // The CA cert is written to disk so sandbox processes can trust it.
@@ -485,6 +612,7 @@ pub async fn run_sandbox(
             tls_state,
             inference_ctx,
             Some(provider_credentials.clone()),
+            Some(policy_local_ctx.clone()),
             denial_tx,
         )
         .await?;
@@ -801,23 +929,24 @@ pub async fn run_sandbox(
         let poll_ocsf_enabled = ocsf_enabled.clone();
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
+        let poll_policy_local = policy_local_ctx.clone();
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
+        let poll_ctx = PolicyPollLoopContext {
+            endpoint: poll_endpoint,
+            sandbox_id: poll_id,
+            opa_engine: poll_engine,
+            entrypoint_pid: poll_pid,
+            interval_secs: poll_interval_secs,
+            ocsf_enabled: poll_ocsf_enabled,
+            provider_credentials: poll_provider_credentials,
+            policy_local_ctx: Some(poll_policy_local),
+        };
 
         tokio::spawn(async move {
-            if let Err(e) = run_policy_poll_loop(
-                &poll_endpoint,
-                &poll_id,
-                &poll_engine,
-                &poll_pid,
-                poll_interval_secs,
-                &poll_ocsf_enabled,
-                poll_provider_credentials,
-            )
-            .await
-            {
+            if let Err(e) = run_policy_poll_loop(poll_ctx).await {
                 ocsf_emit!(
                     AppLifecycleBuilder::new(ocsf_ctx())
                         .activity(ActivityId::Fail)
@@ -2151,22 +2280,25 @@ async fn flush_proposals_to_gateway(
 ///
 /// When the entrypoint PID is available, policy reloads include symlink
 /// resolution for binary paths via the container filesystem.
-async fn run_policy_poll_loop(
-    endpoint: &str,
-    sandbox_id: &str,
-    opa_engine: &Arc<OpaEngine>,
-    entrypoint_pid: &Arc<AtomicU32>,
+struct PolicyPollLoopContext {
+    endpoint: String,
+    sandbox_id: String,
+    opa_engine: Arc<OpaEngine>,
+    entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
-    ocsf_enabled: &std::sync::atomic::AtomicBool,
+    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
     provider_credentials: provider_credentials::ProviderCredentialState,
-) -> Result<()> {
+    policy_local_ctx: Option<Arc<policy_local::PolicyLocalContext>>,
+}
+
+async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     use crate::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::PolicySource;
     use std::sync::atomic::Ordering;
 
-    let client = CachedOpenShellClient::connect(endpoint).await?;
+    let client = CachedOpenShellClient::connect(&ctx.endpoint).await?;
     let mut current_config_revision: u64 = 0;
-    let mut current_provider_env_revision: u64 = provider_credentials.snapshot().revision;
+    let mut current_provider_env_revision: u64 = ctx.provider_credentials.snapshot().revision;
     let mut current_policy_hash = String::new();
     let mut current_settings: std::collections::HashMap<
         String,
@@ -2174,7 +2306,7 @@ async fn run_policy_poll_loop(
     > = std::collections::HashMap::new();
 
     // Initialize revision from the first poll.
-    match client.poll_settings(sandbox_id).await {
+    match client.poll_settings(&ctx.sandbox_id).await {
         Ok(result) => {
             current_config_revision = result.config_revision;
             current_policy_hash = result.policy_hash.clone();
@@ -2189,11 +2321,11 @@ async fn run_policy_poll_loop(
         }
     }
 
-    let interval = Duration::from_secs(interval_secs);
+    let interval = Duration::from_secs(ctx.interval_secs);
     loop {
         tokio::time::sleep(interval).await;
 
-        let result = match client.poll_settings(sandbox_id).await {
+        let result = match client.poll_settings(&ctx.sandbox_id).await {
             Ok(r) => r,
             Err(e) => {
                 debug!(error = %e, "Settings poll: server unreachable, will retry");
@@ -2226,9 +2358,9 @@ async fn run_policy_poll_loop(
             .build());
 
         if provider_env_changed {
-            match grpc_client::fetch_provider_environment(endpoint, sandbox_id).await {
+            match grpc_client::fetch_provider_environment(&ctx.endpoint, &ctx.sandbox_id).await {
                 Ok(env_result) => {
-                    let env_count = provider_credentials.install_environment(
+                    let env_count = ctx.provider_credentials.install_environment(
                         env_result.provider_env_revision,
                         env_result.environment,
                     );
@@ -2273,9 +2405,12 @@ async fn run_policy_poll_loop(
                 continue;
             };
 
-            let pid = entrypoint_pid.load(Ordering::Acquire);
-            match opa_engine.reload_from_proto_with_pid(policy, pid) {
+            let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
+            match ctx.opa_engine.reload_from_proto_with_pid(policy, pid) {
                 Ok(()) => {
+                    if let Some(policy_local_ctx) = ctx.policy_local_ctx.as_ref() {
+                        policy_local_ctx.set_current_policy(policy.clone()).await;
+                    }
                     if result.global_policy_version > 0 {
                         ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Informational)
@@ -2306,7 +2441,7 @@ async fn run_policy_poll_loop(
                     if result.version > 0
                         && result.policy_source == PolicySource::Sandbox
                         && let Err(e) = client
-                            .report_policy_status(sandbox_id, result.version, true, "")
+                            .report_policy_status(&ctx.sandbox_id, result.version, true, "")
                             .await
                     {
                         warn!(error = %e, "Failed to report policy load success");
@@ -2327,7 +2462,12 @@ async fn run_policy_poll_loop(
                     if result.version > 0
                         && result.policy_source == PolicySource::Sandbox
                         && let Err(report_err) = client
-                            .report_policy_status(sandbox_id, result.version, false, &e.to_string())
+                            .report_policy_status(
+                                &ctx.sandbox_id,
+                                result.version,
+                                false,
+                                &e.to_string(),
+                            )
                             .await
                     {
                         warn!(error = %report_err, "Failed to report policy load failure");
@@ -2338,9 +2478,43 @@ async fn run_policy_poll_loop(
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
         let new_ocsf = extract_bool_setting(&result.settings, "ocsf_json_enabled").unwrap_or(false);
-        let prev_ocsf = ocsf_enabled.swap(new_ocsf, Ordering::Relaxed);
+        let prev_ocsf = ctx.ocsf_enabled.swap(new_ocsf, Ordering::Relaxed);
         if new_ocsf != prev_ocsf {
             info!(ocsf_json_enabled = new_ocsf, "OCSF JSONL logging toggled");
+        }
+
+        // Apply the agent-proposals feature toggle. On a false→true transition
+        // we lazily install the skill so a sandbox that started with the flag
+        // off picks up the surface without a recreate. We never uninstall on
+        // a true→false transition: stale skill content on disk is harmless
+        // because route_request and agent_next_steps both gate on the live
+        // atomic, so the agent that reads the skill will see 404s and an
+        // empty `next_steps` array regardless.
+        if let Some(flag) = AGENT_PROPOSALS_ENABLED.get() {
+            let new_proposals = extract_bool_setting(
+                &result.settings,
+                openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY,
+            )
+            .unwrap_or(false);
+            let prev_proposals = flag.swap(new_proposals, Ordering::Relaxed);
+            if new_proposals != prev_proposals {
+                info!(
+                    agent_policy_proposals_enabled = new_proposals,
+                    "agent-driven policy proposals toggled"
+                );
+                if new_proposals && !prev_proposals {
+                    match skills::install_static_skills() {
+                        Ok(installed) => info!(
+                            path = %installed.policy_advisor.display(),
+                            "Installed sandbox agent skill on toggle-on"
+                        ),
+                        Err(error) => warn!(
+                            error = %error,
+                            "Failed to install sandbox agent skill on toggle-on"
+                        ),
+                    }
+                }
+            }
         }
 
         current_config_revision = result.config_revision;
