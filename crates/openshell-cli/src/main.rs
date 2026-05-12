@@ -289,6 +289,7 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   $ openshell policy get my-sandbox
   $ openshell policy set my-sandbox --policy policy.yaml
   $ openshell policy update my-sandbox --add-endpoint api.github.com:443:read-only:rest:enforce
+  $ openshell policy update my-sandbox --add-endpoint realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite,allowed-ip=10.0.0.0/8
   $ openshell policy update my-sandbox --add-allow 'api.github.com:443:GET:/repos/**'
   $ openshell policy set --global --policy policy.yaml
   $ openshell policy delete --global
@@ -1406,7 +1407,7 @@ enum PolicyCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement]]].
+        /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
         #[arg(long = "add-endpoint")]
         add_endpoints: Vec<String>,
 
@@ -1414,11 +1415,11 @@ enum PolicyCommands {
         #[arg(long = "remove-endpoint")]
         remove_endpoints: Vec<String>,
 
-        /// Add a REST allow rule: `host:port:METHOD:path_glob`.
+        /// Add a REST or WebSocket method/path allow rule: `host:port:METHOD:path_glob`.
         #[arg(long = "add-allow")]
         add_allow: Vec<String>,
 
-        /// Add a REST deny rule: `host:port:METHOD:path_glob`.
+        /// Add a REST or WebSocket method/path deny rule: `host:port:METHOD:path_glob`.
         #[arg(long = "add-deny")]
         add_deny: Vec<String>,
 

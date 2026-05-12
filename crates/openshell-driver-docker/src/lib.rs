@@ -1103,7 +1103,7 @@ fn docker_gateway_route(
         };
     }
 
-    if is_compat_docker_runtime(info) {
+    if uses_host_gateway_alias(info) {
         DockerGatewayRoute::HostGateway
     } else {
         DockerGatewayRoute::Bridge {
@@ -1113,15 +1113,15 @@ fn docker_gateway_route(
     }
 }
 
-/// Detect Docker Desktop and behaviourally compatible runtimes — Colima,
-/// Lima, Rancher Desktop, and `OrbStack` — that share Docker Desktop's
-/// routing constraint: the bridge gateway IP is reachable from inside
-/// containers but not from the `OpenShell` server process running on the
-/// host, so callbacks must traverse `host-gateway`.
+/// Detect Docker Desktop and behaviourally compatible runtimes - Colima,
+/// Lima, Rancher Desktop, and `OrbStack` - that share Docker Desktop's routing
+/// constraint: the bridge gateway IP is reachable from inside containers but
+/// not from the `OpenShell` server process running on the host, so callbacks
+/// must traverse `host-gateway`.
 ///
 /// Each runtime is detected via the daemon's reported OS string or hostname,
 /// supplemented by labels where the runtime publishes them.
-fn is_compat_docker_runtime(info: &SystemInfo) -> bool {
+fn uses_host_gateway_alias(info: &SystemInfo) -> bool {
     let operating_system = info
         .operating_system
         .as_deref()
@@ -1159,9 +1159,10 @@ fn docker_extra_hosts(route: &DockerGatewayRoute) -> Vec<String> {
             format!("{HOST_DOCKER_INTERNAL}:{host_alias_ip}"),
             format!("{HOST_OPENSHELL_INTERNAL}:{host_alias_ip}"),
         ],
-        DockerGatewayRoute::HostGateway => {
-            vec![format!("{HOST_OPENSHELL_INTERNAL}:host-gateway")]
-        }
+        DockerGatewayRoute::HostGateway => vec![
+            format!("{HOST_DOCKER_INTERNAL}:host-gateway"),
+            format!("{HOST_OPENSHELL_INTERNAL}:host-gateway"),
+        ],
     }
 }
 
