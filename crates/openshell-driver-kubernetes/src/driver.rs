@@ -1078,6 +1078,12 @@ fn sandbox_template_to_k8s(
             serde_json::json!(runtime_class),
         );
     }
+    if let Some(node_selector) = platform_config_struct(template, "node_selector") {
+        spec.insert("nodeSelector".to_string(), node_selector);
+    }
+    if let Some(tolerations) = platform_config_struct(template, "tolerations") {
+        spec.insert("tolerations".to_string(), tolerations);
+    }
 
     // Per-sandbox platform_config.host_users overrides the cluster-wide default.
     let use_user_namespaces = platform_config_bool(template, "host_users")
@@ -2321,5 +2327,109 @@ mod tests {
                 .any(|e| e["name"] == "OPENSHELL_LOG_LEVEL" && e["value"] == "debug")
         );
         assert!(cr["spec"].get("logLevel").is_none());
+    }
+
+    #[test]
+    fn node_selector_from_platform_config() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "node_selector".to_string(),
+                    Value {
+                        kind: Some(Kind::StructValue(Struct {
+                            fields: std::iter::once((
+                                "gpu-pool".to_string(),
+                                Value {
+                                    kind: Some(Kind::StringValue("true".to_string())),
+                                },
+                            ))
+                            .collect(),
+                        })),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                false,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["nodeSelector"]["gpu-pool"],
+            serde_json::json!("true")
+        );
+    }
+
+    #[test]
+    fn tolerations_from_platform_config() {
+        let toleration = Struct {
+            fields: [
+                (
+                    "key".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("nvidia.com/gpu".to_string())),
+                    },
+                ),
+                (
+                    "operator".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("Exists".to_string())),
+                    },
+                ),
+                (
+                    "effect".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("NoSchedule".to_string())),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "tolerations".to_string(),
+                    Value {
+                        kind: Some(Kind::ListValue(prost_types::ListValue {
+                            values: vec![Value {
+                                kind: Some(Kind::StructValue(toleration)),
+                            }],
+                        })),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                false,
+                &params,
+            )
+        };
+
+        let tolerations = pod_template["spec"]["tolerations"]
+            .as_array()
+            .expect("tolerations should be an array");
+        assert_eq!(tolerations.len(), 1);
+        assert_eq!(tolerations[0]["key"], "nvidia.com/gpu");
+        assert_eq!(tolerations[0]["operator"], "Exists");
+        assert_eq!(tolerations[0]["effect"], "NoSchedule");
     }
 }
