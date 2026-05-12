@@ -8,6 +8,7 @@ use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
 use miette::Result;
 use owo_colors::OwoColorize;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -266,6 +267,7 @@ const FORWARD_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell forward start 8080
   $ openshell forward start 3000 my-sandbox
+  $ openshell forward service my-sandbox --target-port 8000 --local 8000
   $ openshell forward stop 8080
   $ openshell forward list
 ";
@@ -1612,6 +1614,26 @@ enum ForwardCommands {
     /// List active port forwards.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List,
+
+    /// Forward a local TCP port to a loopback service inside a sandbox over gRPC.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Service {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Target service port inside the sandbox.
+        #[arg(long)]
+        target_port: u16,
+
+        /// Target service host inside the sandbox. Phase 1 accepts loopback only.
+        #[arg(long, default_value = "127.0.0.1")]
+        target_host: String,
+
+        /// Local bind address and port: `[bind_address:]port`. Defaults to the target port. Use port 0 for dynamic assignment.
+        #[arg(long)]
+        local: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -1853,6 +1875,27 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+            }
+            ForwardCommands::Service {
+                name,
+                target_port,
+                target_host,
+                local,
+            } => {
+                let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                let mut tls = tls.with_gateway_name(&ctx.name);
+                apply_auth(&mut tls, &ctx.name);
+                let name = resolve_sandbox_name(name, &ctx.name)?;
+                let local = local.unwrap_or_else(|| target_port.to_string());
+                run::service_forward_tcp(
+                    &ctx.endpoint,
+                    &name,
+                    Some(&local),
+                    &target_host,
+                    target_port,
+                    &tls,
+                )
+                .await?;
             }
             ForwardCommands::Start {
                 port,
@@ -2237,7 +2280,7 @@ async fn main() -> Result<()> {
                     };
 
                     // Parse --label flags into a HashMap<String, String>.
-                    let mut labels_map = std::collections::HashMap::new();
+                    let mut labels_map = HashMap::new();
                     for label_str in &labels {
                         let parts: Vec<&str> = label_str.splitn(2, '=').collect();
                         if parts.len() != 2 {
