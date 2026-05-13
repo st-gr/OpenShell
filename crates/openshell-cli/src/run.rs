@@ -36,7 +36,7 @@ use openshell_core::proto::{
     LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
     ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest, ResourceSpec,
     RevokeSshSessionRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
     ServiceEndpointResponse, SetClusterInferenceRequest, SettingScope, SettingValue,
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, UpdateProviderRequest,
@@ -66,8 +66,6 @@ pub use crate::ssh::{
 pub use openshell_core::forward::{
     find_forward_by_port, list_forwards, stop_forward, stop_forwards_for_sandbox,
 };
-
-const NVIDIA_GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 
 /// Convert a sandbox phase integer to a human-readable string.
 fn phase_name(phase: i32) -> &'static str {
@@ -1459,91 +1457,52 @@ async fn finalize_sandbox_create_session(
     session_result
 }
 
-fn parse_sandbox_resources_json(
-    resources_json: Option<&str>,
-    gpu_count: Option<u32>,
-) -> Result<Option<prost_types::Struct>> {
-    let mut resources = match resources_json {
-        Some(raw) => {
-            if raw.trim().is_empty() {
-                return Err(miette::miette!("--resources-json cannot be empty"));
-            }
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SandboxResourceArgs<'a> {
+    pub cpu_request: Option<&'a str>,
+    pub cpu_limit: Option<&'a str>,
+    pub memory_request: Option<&'a str>,
+    pub memory_limit: Option<&'a str>,
+    pub gpu_count: Option<u32>,
+    pub driver_config: &'a [String],
+}
 
-            let value: serde_json::Value = serde_json::from_str(raw)
-                .into_diagnostic()
-                .wrap_err("invalid --resources-json JSON")?;
-            let serde_json::Value::Object(fields) = value else {
-                return Err(miette::miette!("--resources-json must be a JSON object"));
-            };
-
-            Some(json_object_to_prost_struct(fields))
-        }
-        None => None,
+fn build_resource_spec(args: SandboxResourceArgs<'_>) -> Result<Option<ResourceSpec>> {
+    let mut resources = ResourceSpec {
+        driver_config: parse_key_value_pairs(args.driver_config, "--resource-config")?,
+        ..ResourceSpec::default()
     };
 
-    if let Some(count) = gpu_count {
+    if let Some(value) = args.cpu_request {
+        resources.cpu_request = value.to_string();
+    }
+    if let Some(value) = args.cpu_limit {
+        resources.cpu_limit = value.to_string();
+    }
+    if let Some(value) = args.memory_request {
+        resources.memory_request = value.to_string();
+    }
+    if let Some(value) = args.memory_limit {
+        resources.memory_limit = value.to_string();
+    }
+    if let Some(count) = args.gpu_count {
         if count == 0 {
             return Err(miette::miette!("--gpu-count must be greater than zero"));
         }
-        inject_gpu_count_resource(resources.get_or_insert_with(Default::default), count);
+        resources.gpu_count = count;
     }
 
-    Ok(resources)
-}
-
-fn json_object_to_prost_struct(
-    fields: serde_json::Map<String, serde_json::Value>,
-) -> prost_types::Struct {
-    prost_types::Struct {
-        fields: fields
-            .into_iter()
-            .map(|(key, value)| (key, json_value_to_prost_value(value)))
-            .collect(),
+    if resources.cpu_request.is_empty()
+        && resources.cpu_limit.is_empty()
+        && resources.memory_request.is_empty()
+        && resources.memory_limit.is_empty()
+        && resources.gpu_count == 0
+        && resources.driver_config.is_empty()
+    {
+        Ok(None)
+    } else {
+        Ok(Some(resources))
     }
-}
-
-fn json_value_to_prost_value(value: serde_json::Value) -> prost_types::Value {
-    use prost_types::{ListValue, Value, value::Kind};
-
-    let kind = match value {
-        serde_json::Value::Null => Kind::NullValue(0),
-        serde_json::Value::Bool(value) => Kind::BoolValue(value),
-        serde_json::Value::Number(value) => Kind::NumberValue(value.as_f64().unwrap_or_default()),
-        serde_json::Value::String(value) => Kind::StringValue(value),
-        serde_json::Value::Array(values) => Kind::ListValue(ListValue {
-            values: values.into_iter().map(json_value_to_prost_value).collect(),
-        }),
-        serde_json::Value::Object(fields) => Kind::StructValue(json_object_to_prost_struct(fields)),
-    };
-
-    Value { kind: Some(kind) }
-}
-
-fn inject_gpu_count_resource(resources: &mut prost_types::Struct, gpu_count: u32) {
-    use prost_types::{Struct, Value, value::Kind};
-
-    let limits_kind = &mut resources
-        .fields
-        .entry("limits".to_string())
-        .or_insert_with(|| Value {
-            kind: Some(Kind::StructValue(Struct::default())),
-        })
-        .kind;
-
-    if !matches!(limits_kind, Some(Kind::StructValue(_))) {
-        *limits_kind = Some(Kind::StructValue(Struct::default()));
-    }
-
-    let Some(Kind::StructValue(limits)) = limits_kind.as_mut() else {
-        unreachable!("limits kind was normalized to a StructValue");
-    };
-
-    limits.fields.insert(
-        NVIDIA_GPU_RESOURCE_NAME.to_string(),
-        Value {
-            kind: Some(Kind::StringValue(gpu_count.to_string())),
-        },
-    );
 }
 
 /// Create a sandbox with default settings.
@@ -1556,8 +1515,7 @@ pub async fn sandbox_create(
     upload: Option<&(String, Option<String>, bool)>,
     keep: bool,
     gpu: bool,
-    gpu_count: Option<u32>,
-    resources_json: Option<&str>,
+    resources: SandboxResourceArgs<'_>,
     gpu_device: Option<&str>,
     editor: Option<Editor>,
     providers: &[String],
@@ -1574,7 +1532,12 @@ pub async fn sandbox_create(
             "--editor cannot be used with a trailing command; use `openshell sandbox connect <name> --editor ...` after the sandbox is ready"
         ));
     }
-    let resources = parse_sandbox_resources_json(resources_json, gpu_count)?;
+    let resources = build_resource_spec(resources)?;
+    if resources.as_ref().is_some_and(|spec| spec.gpu_count > 0) && gpu_device.is_some() {
+        return Err(miette::miette!(
+            "--gpu-count cannot be combined with --gpu-device"
+        ));
+    }
 
     // Check port availability *before* creating the sandbox so we don't
     // leave an orphaned sandbox behind when the forward would fail.
@@ -1610,8 +1573,9 @@ pub async fn sandbox_create(
         }
         None => None,
     };
-    let requested_gpu =
-        gpu || gpu_count.is_some() || image.as_deref().is_some_and(image_requests_gpu);
+    let requested_gpu = gpu
+        || resources.as_ref().is_some_and(|spec| spec.gpu_count > 0)
+        || image.as_deref().is_some_and(image_requests_gpu);
 
     let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
     let configured_providers = ensure_required_providers(
@@ -1624,10 +1588,9 @@ pub async fn sandbox_create(
 
     let policy = load_sandbox_policy(policy)?;
 
-    let template = if image.is_some() || resources.is_some() {
+    let template = if image.is_some() {
         Some(SandboxTemplate {
             image: image.unwrap_or_default(),
-            resources,
             ..SandboxTemplate::default()
         })
     } else {
@@ -1640,6 +1603,7 @@ pub async fn sandbox_create(
             gpu_device: gpu_device.unwrap_or_default().to_string(),
             policy,
             providers: configured_providers,
+            resources,
             template,
             ..SandboxSpec::default()
         }),
@@ -6109,15 +6073,15 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TlsOptions, dockerfile_sources_supported_for_gateway, format_endpoint,
-        format_gateway_select_header, format_gateway_select_items,
-        format_provider_attachment_table, gateway_add, gateway_auth_label,
-        gateway_env_override_warning, gateway_select_with, gateway_type_label, git_sync_files,
-        http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
+        SandboxResourceArgs, TlsOptions, build_resource_spec,
+        dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
+        format_gateway_select_items, format_provider_attachment_table, gateway_add,
+        gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
+        git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
         inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
-        parse_credential_pairs, parse_sandbox_resources_json, plaintext_gateway_is_remote,
-        provisioning_timeout_message, ready_false_condition_message, resolve_from,
-        sandbox_should_persist, service_expose_status_error, service_url_for_gateway,
+        parse_credential_pairs, plaintext_gateway_is_remote, provisioning_timeout_message,
+        ready_false_condition_message, resolve_from, sandbox_should_persist,
+        service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -6135,83 +6099,54 @@ mod tests {
         Provider, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
     };
 
-    fn prost_struct_field<'a>(
-        value: &'a prost_types::Struct,
-        field: &str,
-    ) -> &'a prost_types::Struct {
-        let value = value
-            .fields
-            .get(field)
-            .and_then(|value| value.kind.as_ref())
-            .unwrap_or_else(|| panic!("expected {field} field"));
-        let prost_types::value::Kind::StructValue(value) = value else {
-            panic!("expected {field} to be an object");
-        };
-        value
-    }
-
-    fn prost_string_field(value: &prost_types::Struct, field: &str) -> String {
-        let value = value
-            .fields
-            .get(field)
-            .and_then(|value| value.kind.as_ref())
-            .unwrap_or_else(|| panic!("expected {field} field"));
-        let prost_types::value::Kind::StringValue(value) = value else {
-            panic!("expected {field} to be a string");
-        };
-        value.clone()
-    }
-
     #[test]
-    fn parse_sandbox_resources_json_rejects_empty_string() {
-        let err = parse_sandbox_resources_json(Some(""), None)
-            .expect_err("empty resources JSON should fail");
-
-        assert!(err.to_string().contains("--resources-json"));
-        assert!(err.to_string().contains("empty"));
-    }
-
-    #[test]
-    fn parse_sandbox_resources_json_rejects_invalid_json() {
-        let err = parse_sandbox_resources_json(Some("{bad"), None)
-            .expect_err("invalid resources JSON should fail");
-
-        assert!(err.to_string().contains("invalid --resources-json JSON"));
-    }
-
-    #[test]
-    fn parse_sandbox_resources_json_rejects_non_object_json() {
-        let err = parse_sandbox_resources_json(Some(r#"["cpu"]"#), None)
-            .expect_err("non-object resources JSON should fail");
-
-        assert!(err.to_string().contains("--resources-json"));
-        assert!(err.to_string().contains("JSON object"));
-    }
-
-    #[test]
-    fn parse_sandbox_resources_json_injects_gpu_count_resource() {
-        let resources = parse_sandbox_resources_json(
-            Some(r#"{"requests":{"cpu":"2"},"limits":{"cpu":"16"}}"#),
-            Some(4),
-        )
+    fn build_resource_spec_sets_typed_fields_and_driver_config() {
+        let driver_config = vec!["kubernetes.resource-name=nvidia.com/mig-1g.5gb".to_string()];
+        let resources = build_resource_spec(SandboxResourceArgs {
+            cpu_request: Some("2"),
+            cpu_limit: Some("4"),
+            memory_request: Some("8Gi"),
+            memory_limit: Some("16Gi"),
+            gpu_count: Some(4),
+            driver_config: &driver_config,
+        })
         .expect("resources should parse")
-        .expect("resources should be present");
+        .expect("resource spec should be present");
 
-        let requests = prost_struct_field(&resources, "requests");
-        let limits = prost_struct_field(&resources, "limits");
-
-        assert_eq!(prost_string_field(requests, "cpu"), "2");
-        assert_eq!(prost_string_field(limits, "cpu"), "16");
-        assert_eq!(prost_string_field(limits, "nvidia.com/gpu"), "4");
+        assert_eq!(resources.cpu_request, "2");
+        assert_eq!(resources.cpu_limit, "4");
+        assert_eq!(resources.memory_request, "8Gi");
+        assert_eq!(resources.memory_limit, "16Gi");
+        assert_eq!(resources.gpu_count, 4);
+        assert_eq!(
+            resources.driver_config.get("kubernetes.resource-name"),
+            Some(&"nvidia.com/mig-1g.5gb".to_string())
+        );
     }
 
     #[test]
-    fn parse_sandbox_resources_json_rejects_zero_gpu_count() {
-        let err =
-            parse_sandbox_resources_json(None, Some(0)).expect_err("zero GPU count should fail");
+    fn build_resource_spec_rejects_zero_gpu_count() {
+        let err = build_resource_spec(SandboxResourceArgs {
+            gpu_count: Some(0),
+            ..SandboxResourceArgs::default()
+        })
+        .expect_err("zero GPU count should fail");
 
         assert!(err.to_string().contains("--gpu-count"));
         assert!(err.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn build_resource_spec_rejects_invalid_driver_config() {
+        let driver_config = vec!["missing-separator".to_string()];
+        let err = build_resource_spec(SandboxResourceArgs {
+            driver_config: &driver_config,
+            ..SandboxResourceArgs::default()
+        })
+        .expect_err("invalid driver config should fail");
+
+        assert!(err.to_string().contains("--resource-config"));
+        assert!(err.to_string().contains("KEY=VALUE"));
     }
 
     struct EnvVarGuard {

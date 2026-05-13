@@ -1245,10 +1245,13 @@ fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_js
         apply("requests", "memory", &req.memory_request);
         apply("limits", "cpu", &req.cpu_limit);
         apply("limits", "memory", &req.memory_limit);
+        if req.gpu_count > 0 {
+            set_gpu_limit(&mut resources, &req.gpu_count.to_string(), true);
+        }
     }
 
     if gpu {
-        apply_gpu_limit(&mut resources, GPU_RESOURCE_QUANTITY);
+        set_gpu_limit(&mut resources, GPU_RESOURCE_QUANTITY, false);
     }
     if resources.as_object().is_some_and(serde_json::Map::is_empty) {
         None
@@ -1257,10 +1260,10 @@ fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_js
     }
 }
 
-fn apply_gpu_limit(resources: &mut serde_json::Value, quantity: &str) {
+fn set_gpu_limit(resources: &mut serde_json::Value, quantity: &str, overwrite: bool) {
     let Some(resources_obj) = resources.as_object_mut() else {
         *resources = serde_json::json!({});
-        return apply_gpu_limit(resources, quantity);
+        return set_gpu_limit(resources, quantity, overwrite);
     };
 
     let limits = resources_obj
@@ -1268,12 +1271,16 @@ fn apply_gpu_limit(resources: &mut serde_json::Value, quantity: &str) {
         .or_insert_with(|| serde_json::json!({}));
     let Some(limits_obj) = limits.as_object_mut() else {
         *limits = serde_json::json!({});
-        return apply_gpu_limit(resources, quantity);
+        return set_gpu_limit(resources, quantity, overwrite);
     };
 
-    limits_obj
-        .entry(GPU_RESOURCE_NAME.to_string())
-        .or_insert_with(|| serde_json::json!(quantity));
+    if overwrite {
+        limits_obj.insert(GPU_RESOURCE_NAME.to_string(), serde_json::json!(quantity));
+    } else {
+        limits_obj
+            .entry(GPU_RESOURCE_NAME.to_string())
+            .or_insert_with(|| serde_json::json!(quantity));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1912,6 +1919,33 @@ mod tests {
             limits[GPU_RESOURCE_NAME],
             serde_json::json!(GPU_RESOURCE_QUANTITY)
         );
+    }
+
+    #[test]
+    fn gpu_resource_spec_sets_gpu_resource_limit() {
+        use openshell_core::proto::compute::v1::DriverResourceRequirements;
+
+        let template = SandboxTemplate {
+            resources: Some(DriverResourceRequirements {
+                gpu_count: 4,
+                ..Default::default()
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                true,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        let limits = &pod_template["spec"]["containers"][0]["resources"]["limits"];
+        assert_eq!(limits[GPU_RESOURCE_NAME], serde_json::json!("4"));
     }
 
     #[test]

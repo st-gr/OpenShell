@@ -659,30 +659,6 @@ fn test_tls(server: &TestServer) -> TlsOptions {
     server.tls.with_gateway_name("openshell")
 }
 
-fn struct_field<'a>(value: &'a prost_types::Struct, field: &str) -> &'a prost_types::Struct {
-    let value = value
-        .fields
-        .get(field)
-        .and_then(|value| value.kind.as_ref())
-        .unwrap_or_else(|| panic!("expected {field} field"));
-    let prost_types::value::Kind::StructValue(value) = value else {
-        panic!("expected {field} to be an object");
-    };
-    value
-}
-
-fn string_field(value: &prost_types::Struct, field: &str) -> String {
-    let value = value
-        .fields
-        .get(field)
-        .and_then(|value| value.kind.as_ref())
-        .unwrap_or_else(|| panic!("expected {field} field"));
-    let prost_types::value::Kind::StringValue(value) = value else {
-        panic!("expected {field} to be a string");
-    };
-    value.clone()
-}
-
 #[tokio::test]
 async fn sandbox_create_keeps_command_sessions_by_default() {
     let server = run_server().await;
@@ -700,8 +676,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         None,
         true,
         false,
-        None,
-        None,
+        run::SandboxResourceArgs::default(),
         None,
         None,
         &[],
@@ -741,8 +716,10 @@ async fn sandbox_create_gpu_count_sets_gpu_intent_and_resources() {
         None,
         true,
         false,
-        Some(2),
-        None,
+        run::SandboxResourceArgs {
+            gpu_count: Some(2),
+            ..run::SandboxResourceArgs::default()
+        },
         None,
         None,
         &[],
@@ -765,16 +742,14 @@ async fn sandbox_create_gpu_count_sets_gpu_intent_and_resources() {
     assert!(spec.gpu);
 
     let resources = spec
-        .template
+        .resources
         .as_ref()
-        .and_then(|template| template.resources.as_ref())
-        .expect("gpu count should create template resources");
-    let limits = struct_field(resources, "limits");
-    assert_eq!(string_field(limits, "nvidia.com/gpu"), "2");
+        .expect("gpu count should create resource spec");
+    assert_eq!(resources.gpu_count, 2);
 }
 
 #[tokio::test]
-async fn sandbox_create_resources_json_sets_template_resources() {
+async fn sandbox_create_resource_spec_sets_resource_requirements() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
     let xdg_dir = tempfile::tempdir().unwrap();
@@ -784,14 +759,19 @@ async fn sandbox_create_resources_json_sets_template_resources() {
 
     run::sandbox_create(
         &server.endpoint,
-        Some("resources-json"),
+        Some("resource-spec"),
         None,
         "openshell",
         None,
         true,
         false,
-        None,
-        Some(r#"{"requests":{"cpu":"2"},"limits":{"cpu":"16"}}"#),
+        run::SandboxResourceArgs {
+            cpu_request: Some("2"),
+            cpu_limit: Some("4"),
+            memory_request: Some("8Gi"),
+            memory_limit: Some("16Gi"),
+            ..run::SandboxResourceArgs::default()
+        },
         None,
         None,
         &[],
@@ -814,14 +794,13 @@ async fn sandbox_create_resources_json_sets_template_resources() {
     assert!(!spec.gpu);
 
     let resources = spec
-        .template
+        .resources
         .as_ref()
-        .and_then(|template| template.resources.as_ref())
-        .expect("resources JSON should create template resources");
-    let requests = struct_field(resources, "requests");
-    let limits = struct_field(resources, "limits");
-    assert_eq!(string_field(requests, "cpu"), "2");
-    assert_eq!(string_field(limits, "cpu"), "16");
+        .expect("resource flags should create resource spec");
+    assert_eq!(resources.cpu_request, "2");
+    assert_eq!(resources.cpu_limit, "4");
+    assert_eq!(resources.memory_request, "8Gi");
+    assert_eq!(resources.memory_limit, "16Gi");
 }
 
 #[tokio::test]
@@ -841,8 +820,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         None,
         false,
         false,
-        None,
-        None,
+        run::SandboxResourceArgs::default(),
         None,
         None,
         &[],
@@ -885,8 +863,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         None,
         false,
         false,
-        None,
-        None,
+        run::SandboxResourceArgs::default(),
         None,
         None,
         &[],
@@ -929,8 +906,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         None,
         true,
         false,
-        None,
-        None,
+        run::SandboxResourceArgs::default(),
         None,
         None,
         &[],
@@ -973,8 +949,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         None,
         false,
         false,
-        None,
-        None,
+        run::SandboxResourceArgs::default(),
         None,
         None,
         &[],
