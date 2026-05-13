@@ -42,8 +42,18 @@ openshell sandbox create --gpu-count 4 -- claude
 ```
 
 GPU counts schedule Kubernetes sandbox pods with an `nvidia.com/gpu` resource
-limit. Use `--gpu-device` only when you need driver-specific device selection;
-it cannot be combined with `--gpu-count`.
+limit.
+
+To pass generic resource requests and limits through to the sandbox template,
+use `--resources-json` with a JSON object:
+
+```shell
+openshell sandbox create \
+  --resources-json '{"requests":{"cpu":"2"},"limits":{"cpu":"16"}}'
+```
+
+The JSON is forwarded as `SandboxTemplate.resources`. Use Kubernetes resource
+quantity strings for CPU, memory, and extended resources.
 
 For Docker-backed sandboxes, GPU injection uses Docker CDI. If you enable Docker
 CDI after the gateway starts, restart the gateway so OpenShell can detect the

@@ -1088,8 +1088,16 @@ enum SandboxCommands {
         ///
         /// This implies --gpu. Kubernetes-backed gateways schedule pods with
         /// the corresponding nvidia.com/gpu resource limit.
-        #[arg(long, value_name = "COUNT", conflicts_with = "gpu_device", value_parser = clap::value_parser!(u32).range(1..))]
+        #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..))]
         gpu_count: Option<u32>,
+
+        /// Set compute resource requests and limits as JSON.
+        ///
+        /// The JSON must be an object with the same shape as
+        /// SandboxTemplate.resources, for example:
+        /// {"requests":{"cpu":"2"},"limits":{"cpu":"16"}}
+        #[arg(long, value_name = "JSON")]
+        resources_json: Option<String>,
 
         /// Target a driver-specific GPU device. Docker and Podman use CDI device IDs
         /// (for example "nvidia.com/gpu=0"); VM uses a PCI BDF or index.
@@ -2372,6 +2380,7 @@ async fn main() -> Result<()> {
                     editor,
                     gpu,
                     gpu_count,
+                    resources_json,
                     gpu_device,
                     providers,
                     policy,
@@ -2439,6 +2448,7 @@ async fn main() -> Result<()> {
                         keep,
                         gpu,
                         gpu_count,
+                        resources_json.as_deref(),
                         gpu_device.as_deref(),
                         editor,
                         &providers,
@@ -3843,23 +3853,27 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_create_gpu_count_conflicts_with_gpu_device() {
-        let result = Cli::try_parse_from([
+    fn sandbox_create_resources_json_parses() {
+        let cli = Cli::try_parse_from([
             "openshell",
             "sandbox",
             "create",
-            "--gpu",
-            "--gpu-count",
-            "2",
-            "--gpu-device",
-            "nvidia.com/gpu=0",
-        ]);
-        assert!(
-            result.is_err(),
-            "sandbox create should reject combining --gpu-count with --gpu-device"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("--gpu-count"));
-        assert!(err.contains("--gpu-device"));
+            "--resources-json",
+            r#"{"requests":{"cpu":"2"},"limits":{"cpu":"16"}}"#,
+        ])
+        .expect("sandbox create --resources-json should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { resources_json, .. }),
+                ..
+            }) => {
+                assert_eq!(
+                    resources_json.as_deref(),
+                    Some(r#"{"requests":{"cpu":"2"},"limits":{"cpu":"16"}}"#)
+                );
+            }
+            other => panic!("expected sandbox create command, got: {other:?}"),
+        }
     }
 }

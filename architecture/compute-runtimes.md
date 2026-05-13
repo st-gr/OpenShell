@@ -63,7 +63,8 @@ Custom sandbox images must include the agent runtime and any system
 dependencies, but they should not need to include the gateway. GPU-capable
 images must include the user-space libraries required by the workload. The
 runtime still owns GPU device injection or resource scheduling. Kubernetes maps
-GPU counts to pod `nvidia.com/gpu` limits when the cluster exposes that resource.
+template resource limits such as `nvidia.com/gpu` into the sandbox pod when the
+cluster exposes those resources.
 
 ## Deployment Shape
 
