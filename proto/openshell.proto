@@ -48,6 +48,18 @@ service OpenShell {
   // Create a short-lived SSH session for a sandbox.
   rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse);
 
+  // Create or update a sandbox HTTP service endpoint for local routing.
+  rpc ExposeService(ExposeServiceRequest) returns (ServiceEndpointResponse);
+
+  // Fetch one sandbox HTTP service endpoint.
+  rpc GetService(GetServiceRequest) returns (ServiceEndpointResponse);
+
+  // List sandbox HTTP service endpoints.
+  rpc ListServices(ListServicesRequest) returns (ListServicesResponse);
+
+  // Delete one sandbox HTTP service endpoint.
+  rpc DeleteService(DeleteServiceRequest) returns (DeleteServiceResponse);
+
   // Revoke a previously issued SSH session.
   rpc RevokeSshSession(RevokeSshSessionRequest) returns (RevokeSshSessionResponse);
 
@@ -455,6 +467,77 @@ message CreateSshSessionResponse {
 
   // Expiry timestamp in milliseconds since epoch. 0 means no expiry.
   int64 expires_at_ms = 8;
+}
+
+// Request to expose an HTTP service running inside a sandbox.
+message ExposeServiceRequest {
+  // Sandbox name.
+  string sandbox = 1;
+  // Service name within the sandbox.
+  string service = 2;
+  // Loopback TCP port inside the sandbox.
+  uint32 target_port = 3;
+  // Whether to print/use the browser-facing service URL.
+  bool domain = 4;
+}
+
+// Request to fetch an exposed sandbox service endpoint.
+message GetServiceRequest {
+  // Sandbox name.
+  string sandbox = 1;
+  // Service name within the sandbox. Empty selects the unnamed endpoint.
+  string service = 2;
+}
+
+// Request to list exposed sandbox service endpoints.
+message ListServicesRequest {
+  // Optional sandbox name. Empty lists endpoints for all sandboxes.
+  string sandbox = 1;
+  // Page size. Zero uses the server default.
+  uint32 limit = 2;
+  // Page offset.
+  uint32 offset = 3;
+}
+
+// Response containing exposed sandbox service endpoints.
+message ListServicesResponse {
+  repeated ServiceEndpointResponse services = 1;
+}
+
+// Request to delete an exposed sandbox service endpoint.
+message DeleteServiceRequest {
+  // Sandbox name.
+  string sandbox = 1;
+  // Service name within the sandbox. Empty selects the unnamed endpoint.
+  string service = 2;
+}
+
+// Response for deleting an exposed sandbox service endpoint.
+message DeleteServiceResponse {
+  // True when an endpoint existed and was deleted.
+  bool deleted = 1;
+}
+
+// Persisted sandbox service endpoint.
+message ServiceEndpoint {
+  // Kubernetes-style metadata.
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  // Sandbox object ID.
+  string sandbox_id = 2;
+  // Sandbox name.
+  string sandbox_name = 3;
+  // Service name within the sandbox.
+  string service_name = 4;
+  // Loopback TCP port inside the sandbox.
+  uint32 target_port = 5;
+  // Whether browser-facing service routing is enabled for this endpoint.
+  bool domain = 6;
+}
+
+// Response containing a service endpoint and, when available, its local URL.
+message ServiceEndpointResponse {
+  ServiceEndpoint endpoint = 1;
+  string url = 2;
 }
 
 // Revoke SSH session request.

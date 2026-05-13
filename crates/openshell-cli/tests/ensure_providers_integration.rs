@@ -213,6 +213,36 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(CreateSshSessionResponse::default()))
     }
 
+    async fn expose_service(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ExposeServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ServiceEndpointResponse::default(),
+        ))
+    }
+
+    async fn get_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_services(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListServicesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListServicesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteServiceResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn revoke_ssh_session(
         &self,
         _request: tonic::Request<RevokeSshSessionRequest>,
