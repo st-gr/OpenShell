@@ -421,9 +421,17 @@ WHERE "object_type" = ?1
         Ok(result.rows_affected())
     }
 
-    pub async fn put_draft_chunk(&self, chunk: &DraftChunkRecord) -> PersistenceResult<()> {
+    pub async fn put_draft_chunk(
+        &self,
+        chunk: &DraftChunkRecord,
+        dedup_key: Option<&str>,
+    ) -> PersistenceResult<String> {
         let payload = draft_chunk_payload_from_record(chunk)?;
-        sqlx::query(
+        // RETURNING "id" gives us the row's effective id regardless of
+        // whether INSERT inserted a fresh row or ON CONFLICT updated an
+        // existing one. Callers report this id to clients so the response
+        // can never advertise a chunk_id that isn't actually persisted.
+        let row = sqlx::query(
             r#"
 INSERT INTO "objects" (
     "object_type", "id", "scope", "status", "dedup_key", "hit_count", "payload", "created_at_ms", "updated_at_ms"
@@ -432,21 +440,22 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
 ON CONFLICT ("object_type", "scope", "dedup_key") WHERE "dedup_key" IS NOT NULL DO UPDATE SET
     "hit_count" = "objects"."hit_count" + excluded."hit_count",
     "updated_at_ms" = excluded."updated_at_ms"
+RETURNING "id"
 "#,
         )
         .bind(DRAFT_CHUNK_OBJECT_TYPE)
         .bind(&chunk.id)
         .bind(&chunk.sandbox_id)
         .bind(&chunk.status)
-        .bind(draft_chunk_dedup_key(chunk))
+        .bind(dedup_key)
         .bind(i64::from(chunk.hit_count))
         .bind(payload)
         .bind(chunk.first_seen_ms)
         .bind(chunk.last_seen_ms)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(|e| map_db_error(&e))?;
-        Ok(())
+        Ok(row.get::<String, _>("id"))
     }
 
     pub async fn get_draft_chunk(&self, id: &str) -> PersistenceResult<Option<DraftChunkRecord>> {
@@ -509,6 +518,7 @@ ORDER BY "created_at_ms" DESC
         id: &str,
         status: &str,
         decided_at_ms: Option<i64>,
+        rejection_reason: Option<&str>,
     ) -> PersistenceResult<bool> {
         let Some(mut record) = self.get_draft_chunk(id).await? else {
             return Ok(false);
@@ -517,6 +527,9 @@ ORDER BY "created_at_ms" DESC
         record.status = status.to_string();
         record.decided_at_ms = decided_at_ms;
         record.last_seen_ms = current_time_ms()?;
+        if let Some(reason) = rejection_reason {
+            record.rejection_reason = reason.to_string();
+        }
         let payload = draft_chunk_payload_from_record(&record)?;
 
         let result = sqlx::query(
@@ -621,10 +634,6 @@ WHERE "object_type" = ?1 AND "scope" = ?2
         }
         Ok(max_version)
     }
-}
-
-fn draft_chunk_dedup_key(chunk: &DraftChunkRecord) -> String {
-    format!("{}|{}|{}", chunk.host, chunk.port, chunk.binary)
 }
 
 /// Restrict the on-disk `SQLite` database file (and its WAL/SHM sidecars,
