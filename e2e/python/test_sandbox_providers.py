@@ -345,7 +345,7 @@ def test_passthrough_and_canonical_credentials_coexist(
             assert result.exit_code == 0, result.stderr
             signing, api = result.stdout.strip().split("|", 1)
             assert signing == real_signing_secret
-            assert api == "openshell:resolve:env:SLACK_API_KEY"
+            assert _is_placeholder_for_env_key(api, "SLACK_API_KEY")
 
 
 # ===========================================================================
