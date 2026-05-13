@@ -182,7 +182,7 @@ openshell provider create \
   --passthrough SLACK_SIGNING_SECRET
 ```
 
-`--passthrough` is repeatable. Each key must also appear in `--credential`. The same flag is available on `openshell provider update`.
+`--passthrough` is repeatable, and the same flag is available on `openshell provider update`. Each key must exist in the resolved provider credentials — supplied via `--credential`, discovered through `--from-existing`, or, on `update`, already stored against the provider.
 
 <Warning>
 Passthrough drops the "agent never sees the real secret" invariant for the listed keys. The real value sits in `/proc/<agent-pid>/environ` and any descendant process inherits it. Use it only when the consumer demonstrably fails with the canonical placeholder — prefer the placeholder model whenever the consumer permits it.
