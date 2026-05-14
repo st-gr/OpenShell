@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     libclang-dev \
     libssl-dev \
+    libprotobuf-dev \
     pkg-config \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*

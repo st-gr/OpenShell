@@ -34,12 +34,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     proto_files.sort();
 
     // Requires `protoc`. Local and CI builds get it from mise; Docker build
-    // images install protobuf-compiler. Those protoc distributions also
-    // provide the well-known type includes used by imports such as
-    // google/protobuf/struct.proto.
+    // images and RPM builds install protobuf packages. Some distro protoc
+    // packages split the well-known type includes into a separate development
+    // package and do not search that directory automatically, so pass it
+    // explicitly when it is present.
     let mut prost_config = prost_build::Config::new();
     if let Some(protoc) = resolve_protoc_from_mise() {
         prost_config.protoc_executable(protoc);
+    }
+    for include_dir in well_known_proto_include_dirs() {
+        println!(
+            "cargo:rerun-if-changed={}",
+            include_dir.join("google/protobuf/struct.proto").display()
+        );
+        prost_config.protoc_arg(format!("--proto_path={}", include_dir.display()));
     }
     tonic_build::configure()
         .build_server(true)
@@ -54,8 +62,45 @@ fn resolve_protoc_from_mise() -> Option<PathBuf> {
         return None;
     }
 
+    let protoc = mise_tool_root("protoc")?.join("bin").join("protoc");
+    protoc.is_file().then_some(protoc)
+}
+
+fn well_known_proto_include_dirs() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = env::var_os("PROTOC_INCLUDE") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(path) = env::var_os("PROTOC")
+        && let Some(root) = Path::new(&path).parent().and_then(Path::parent)
+    {
+        candidates.push(root.join("include"));
+    }
+    if let Some(root) = mise_tool_root("protoc") {
+        candidates.push(root.join("include"));
+    }
+
+    candidates.extend([
+        PathBuf::from("/usr/include"),
+        PathBuf::from("/usr/local/include"),
+        PathBuf::from("/opt/homebrew/include"),
+    ]);
+
+    let mut dirs = Vec::new();
+    for candidate in candidates {
+        if candidate.join("google/protobuf/struct.proto").is_file()
+            && !dirs.iter().any(|dir| dir == &candidate)
+        {
+            dirs.push(candidate);
+        }
+    }
+    dirs
+}
+
+fn mise_tool_root(tool: &str) -> Option<PathBuf> {
     let output = std::process::Command::new("mise")
-        .args(["where", "protoc"])
+        .args(["where", tool])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -63,8 +108,7 @@ fn resolve_protoc_from_mise() -> Option<PathBuf> {
     }
 
     let root = String::from_utf8(output.stdout).ok()?;
-    let protoc = PathBuf::from(root.trim()).join("bin").join("protoc");
-    protoc.is_file().then_some(protoc)
+    Some(PathBuf::from(root.trim()))
 }
 
 fn command_exists(command: &str) -> bool {

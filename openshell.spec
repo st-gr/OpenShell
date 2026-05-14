@@ -43,6 +43,8 @@ BuildRequires:  make
 BuildRequires:  cmake
 BuildRequires:  pkg-config
 BuildRequires:  clang-devel
+BuildRequires:  protobuf-compiler
+BuildRequires:  protobuf-devel
 BuildRequires:  z3-devel
 BuildRequires:  systemd-rpm-macros
 

@@ -51,6 +51,7 @@ jobs:
             packit rpm-build \
             rust cargo gcc gcc-c++ make cmake pkg-config \
             clang-devel z3-devel systemd-rpm-macros \
+            protobuf-compiler protobuf-devel \
             pandoc python3-devel git-core \
             cargo-rpm-macros
 
