@@ -1,8 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use openshell_core::config::DEFAULT_SUPERVISOR_IMAGE;
+use serde::{Deserialize, Serialize};
+
+/// Default Kubernetes namespace for sandbox resources.
+pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
+
 /// How the supervisor binary is delivered into sandbox pods.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SupervisorSideloadMethod {
     /// Mount the supervisor OCI image directly as a read-only volume
     /// (requires Kubernetes >= v1.33 with the `ImageVolume` feature gate,
@@ -37,7 +44,8 @@ impl std::str::FromStr for SupervisorSideloadMethod {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
     pub namespace: String,
     pub default_image: String,
@@ -56,4 +64,33 @@ pub struct KubernetesComputeConfig {
     pub client_tls_secret_name: String,
     pub host_gateway_ip: String,
     pub enable_user_namespaces: bool,
+}
+
+impl Default for KubernetesComputeConfig {
+    fn default() -> Self {
+        Self {
+            namespace: DEFAULT_K8S_NAMESPACE.to_string(),
+            default_image: default_sandbox_image(),
+            // Default empty so the gateway omits `imagePullPolicy` from pod
+            // specs and Kubernetes applies its own default (Always for `latest`,
+            // IfNotPresent otherwise). `DEFAULT_IMAGE_PULL_POLICY` ("missing")
+            // is Podman vocabulary and is not a valid Kubernetes value.
+            image_pull_policy: String::new(),
+            supervisor_image: DEFAULT_SUPERVISOR_IMAGE.to_string(),
+            supervisor_image_pull_policy: String::new(),
+            supervisor_sideload_method: SupervisorSideloadMethod::default(),
+            grpc_endpoint: String::new(),
+            ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
+            client_tls_secret_name: String::new(),
+            host_gateway_ip: String::new(),
+            enable_user_namespaces: false,
+        }
+    }
+}
+
+fn default_sandbox_image() -> String {
+    format!(
+        "{}/base:latest",
+        openshell_core::image::DEFAULT_COMMUNITY_REGISTRY
+    )
 }

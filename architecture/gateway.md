@@ -193,6 +193,44 @@ pre-created Secrets) disable the Helm hook via `pkiInitJob.enabled=false`.
 The chart also ships a `certManager.*` path that produces equivalent Secrets
 through cert-manager `Issuer`/`Certificate` resources.
 
+## Configuration
+
+The gateway reads its configuration from three sources, merged in this
+precedence (highest first):
+
+```
+Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in default
+```
+
+The TOML file is opt-in via `--config <PATH>` / `OPENSHELL_GATEWAY_CONFIG`.
+Driver implementation settings live in the TOML driver tables. See
+`docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
+0003 for the full schema.
+
+`database_url` is env-only and rejected when present in the file
+(`OPENSHELL_DB_URL` / `--db-url`).
+
+### Driver inheritance
+
+`[openshell.gateway]` carries a small set of values (`sandbox_namespace`,
+`default_image`,
+`supervisor_image`, `guest_tls_ca/cert/key`, `client_tls_secret_name`,
+`host_gateway_ip`, `enable_user_namespaces`) that are inherited into each
+driver's `[openshell.drivers.<name>]` table when the driver-specific table
+does not override them. The allowlist is per-driver so a gateway-wide
+default cannot land in a driver that does not understand it (e.g.
+`client_tls_secret_name` is K8s-only).
+
+`image_pull_policy` is intentionally **not** inheritable: Kubernetes uses
+`Always | IfNotPresent | Never` (passed verbatim to the K8s API) while
+Podman uses the lowercase enum `always | missing | never | newer`. No
+value means the same thing in both, so the key lives only under each
+driver's own table.
+
+Driver-specific values that are not part of the inheritance allowlist
+(e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
+table.
+
 ## Operational Constraints
 
 - Gateway TLS and client certificate distribution are deployment concerns owned
