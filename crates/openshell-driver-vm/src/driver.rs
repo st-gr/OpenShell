@@ -758,12 +758,14 @@ impl VmDriver {
         sandbox_id: &str,
         image_ref: &str,
     ) -> Result<String, Status> {
-        if let Some((docker, image_identity)) = self.resolve_local_docker_image(image_ref).await? {
+        if let Some((engine, image_identity)) =
+            self.resolve_local_container_image(image_ref).await?
+        {
             return self
                 .ensure_cached_local_image_rootfs_archive(
                     sandbox_id,
                     image_ref,
-                    &docker,
+                    &engine,
                     &image_identity,
                 )
                 .await;
@@ -856,31 +858,30 @@ impl VmDriver {
         Ok(image_identity)
     }
 
-    async fn resolve_local_docker_image(
+    async fn resolve_local_container_image(
         &self,
         image_ref: &str,
     ) -> Result<Option<(Docker, String)>, Status> {
         let required_local_image = is_openshell_local_build_image_ref(image_ref);
-        let docker = match Docker::connect_with_local_defaults() {
-            Ok(docker) => docker,
-            Err(err) if required_local_image => {
+        let engine = match connect_local_container_engine().await {
+            Some(engine) => engine,
+            None if required_local_image => {
                 return Err(Status::failed_precondition(format!(
-                    "failed to connect to local Docker daemon for locally built sandbox image '{image_ref}': {err}"
+                    "no container engine (Docker/Podman) available for locally built sandbox image '{image_ref}'"
                 )));
             }
-            Err(err) => {
+            None => {
                 warn!(
                     image_ref = %image_ref,
-                    error = %err,
-                    "vm driver: local Docker daemon unavailable, falling back to registry"
+                    "vm driver: no local container engine available, falling back to registry"
                 );
                 return Ok(None);
             }
         };
 
-        match docker.inspect_image(image_ref).await {
+        match engine.inspect_image(image_ref).await {
             Ok(inspect) => {
-                if let Some(message) = local_docker_image_platform_mismatch(
+                if let Some(message) = local_image_platform_mismatch(
                     image_ref,
                     inspect.os.as_deref(),
                     inspect.architecture.as_deref(),
@@ -891,30 +892,28 @@ impl VmDriver {
                     warn!(
                         image_ref = %image_ref,
                         %message,
-                        "vm driver: local Docker image platform mismatch, falling back to registry"
+                        "vm driver: local container image platform mismatch, falling back to registry"
                     );
                     return Ok(None);
                 }
 
-                let image_identity =
-                    inspect
-                        .id
-                        .filter(|id| !id.trim().is_empty())
-                        .ok_or_else(|| {
-                            Status::failed_precondition(format!(
-                                "local Docker image '{image_ref}' inspect response has no image ID"
-                            ))
-                        })?;
+                let image_identity = inspect.id.filter(|id| !id.trim().is_empty()).ok_or_else(
+                    || {
+                        Status::failed_precondition(format!(
+                            "local container image '{image_ref}' inspect response has no image ID"
+                        ))
+                    },
+                )?;
                 info!(
                     image_ref = %image_ref,
                     image_identity = %image_identity,
-                    "vm driver: resolved image from local Docker daemon"
+                    "vm driver: resolved image from local container engine"
                 );
-                Ok(Some((docker, image_identity)))
+                Ok(Some((engine, image_identity)))
             }
             Err(err) if is_docker_not_found_error(&err) && required_local_image => {
                 Err(Status::failed_precondition(format!(
-                    "locally built sandbox image '{image_ref}' is not present in the local Docker daemon"
+                    "locally built sandbox image '{image_ref}' is not present in the local container engine"
                 )))
             }
             Err(err) if is_docker_not_found_error(&err) => Ok(None),
@@ -925,7 +924,7 @@ impl VmDriver {
                 warn!(
                     image_ref = %image_ref,
                     error = %err,
-                    "vm driver: local Docker image inspection failed, falling back to registry"
+                    "vm driver: local container image inspection failed, falling back to registry"
                 );
                 Ok(None)
             }
@@ -1517,11 +1516,60 @@ fn parse_registry_reference(image_ref: &str) -> Result<Reference, Status> {
     })
 }
 
+/// Try to connect to a local container engine (Docker or Podman).
+///
+/// Tries Docker first (`connect_with_local_defaults`, which respects
+/// `DOCKER_HOST`). If Docker is unavailable, falls back to the Podman
+/// socket, which exposes a Docker-compatible API.
+async fn connect_local_container_engine() -> Option<Docker> {
+    if let Ok(docker) = Docker::connect_with_local_defaults() {
+        if docker.ping().await.is_ok() {
+            return Some(docker);
+        }
+    }
+
+    let podman_socket = podman_socket_path();
+    if podman_socket.exists() {
+        if let Ok(docker) =
+            Docker::connect_with_unix(podman_socket.to_str()?, 120, bollard::API_DEFAULT_VERSION)
+        {
+            if docker.ping().await.is_ok() {
+                info!(
+                    socket = %podman_socket.display(),
+                    "vm driver: connected to Podman (Docker-compatible API)"
+                );
+                return Some(docker);
+            }
+        }
+    }
+
+    None
+}
+
+/// Podman user socket path for the current platform.
+fn podman_socket_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        PathBuf::from(home).join(".local/share/containers/podman/machine/podman.sock")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var("XDG_RUNTIME_DIR").map_or_else(
+            |_| {
+                let uid = nix::unistd::getuid();
+                PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
+            },
+            |xdg| PathBuf::from(xdg).join("podman/podman.sock"),
+        )
+    }
+}
+
 fn is_openshell_local_build_image_ref(image_ref: &str) -> bool {
     image_ref.starts_with("openshell/sandbox-from:")
 }
 
-fn local_docker_image_platform_mismatch(
+fn local_image_platform_mismatch(
     image_ref: &str,
     actual_os: Option<&str>,
     actual_arch: Option<&str>,
@@ -2918,9 +2966,9 @@ mod tests {
     }
 
     #[test]
-    fn local_docker_image_platform_mismatch_checks_guest_platform() {
+    fn local_image_platform_mismatch_checks_guest_platform() {
         assert!(
-            local_docker_image_platform_mismatch(
+            local_image_platform_mismatch(
                 "openshell/sandbox-from:123",
                 Some("linux"),
                 Some(linux_oci_arch()),
@@ -2928,7 +2976,7 @@ mod tests {
             .is_none()
         );
 
-        let err = local_docker_image_platform_mismatch(
+        let err = local_image_platform_mismatch(
             "openshell/sandbox-from:123",
             Some("linux"),
             Some("wrong-arch"),
@@ -2937,7 +2985,7 @@ mod tests {
         assert!(err.contains("wrong-arch"));
         assert!(err.contains(linux_oci_arch()));
 
-        let err = local_docker_image_platform_mismatch("openshell/sandbox-from:123", None, None)
+        let err = local_image_platform_mismatch("openshell/sandbox-from:123", None, None)
             .expect("unknown platform should be reported");
         assert!(err.contains("unknown/unknown"));
     }
