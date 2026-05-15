@@ -76,6 +76,9 @@ pub struct VmComputeConfig {
     /// Gateway gRPC endpoint the sandbox guest connects back to.
     pub grpc_endpoint: String,
 
+    /// Bootstrap image used to boot and prepare VM sandbox target images.
+    pub bootstrap_image: String,
+
     /// libkrun log level used by the VM driver helper.
     pub krun_log_level: u32,
 
@@ -84,6 +87,9 @@ pub struct VmComputeConfig {
 
     /// Default memory allocation for VM sandboxes, in MiB.
     pub mem_mib: u32,
+
+    /// Writable overlay disk size for each VM sandbox, in MiB.
+    pub overlay_disk_mib: u64,
 
     /// Host-side CA certificate for the guest's mTLS client bundle.
     pub guest_tls_ca: Option<PathBuf>,
@@ -120,6 +126,12 @@ impl VmComputeConfig {
         2048
     }
 
+    /// Default writable overlay disk size, in MiB.
+    #[must_use]
+    pub const fn default_overlay_disk_mib() -> u64 {
+        4096
+    }
+
     #[must_use]
     fn default_driver_search_dirs(home: Option<PathBuf>) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
@@ -140,9 +152,11 @@ impl Default for VmComputeConfig {
             driver_dir: None,
             default_image: default_sandbox_image(),
             grpc_endpoint: String::new(),
+            bootstrap_image: String::new(),
             krun_log_level: Self::default_krun_log_level(),
             vcpus: Self::default_vcpus(),
             mem_mib: Self::default_mem_mib(),
+            overlay_disk_mib: Self::default_overlay_disk_mib(),
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
@@ -266,11 +280,15 @@ fn prepare_vm_state_dir(state_dir: &Path, expected_uid: u32) -> Result<()> {
     })?;
     let metadata = checked_directory_metadata(state_dir, expected_uid, "vm driver state dir")?;
     let mode = metadata.permissions().mode() & 0o777;
-    if mode & 0o022 != 0 {
-        return Err(Error::execution(format!(
-            "vm driver state dir '{}' must not be group/world-writable (mode {mode:03o})",
-            state_dir.display()
-        )));
+    if mode != 0o700 {
+        std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+            |err| {
+                Error::execution(format!(
+                    "failed to restrict vm driver state dir '{}': {err}",
+                    state_dir.display()
+                ))
+            },
+        )?;
     }
     Ok(())
 }
@@ -452,11 +470,19 @@ pub async fn spawn(
     if !vm_config.default_image.trim().is_empty() {
         command.arg("--default-image").arg(&vm_config.default_image);
     }
+    if !vm_config.bootstrap_image.trim().is_empty() {
+        command
+            .arg("--bootstrap-image")
+            .arg(&vm_config.bootstrap_image);
+    }
     command
         .arg("--krun-log-level")
         .arg(vm_config.krun_log_level.to_string());
     command.arg("--vcpus").arg(vm_config.vcpus.to_string());
     command.arg("--mem-mib").arg(vm_config.mem_mib.to_string());
+    command
+        .arg("--overlay-disk-mib")
+        .arg(vm_config.overlay_disk_mib.to_string());
     if let Some(tls) = guest_tls_paths {
         command.arg("--guest-tls-ca").arg(tls.ca);
         command.arg("--guest-tls-cert").arg(tls.cert);
@@ -698,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_compute_driver_socket_path_rejects_writable_state_dir() {
+    fn prepare_compute_driver_socket_path_restricts_existing_state_dir() {
         let dir = tempdir().unwrap();
         let vm_config = VmComputeConfig {
             state_dir: dir.path().join("state"),
@@ -709,10 +735,14 @@ mod tests {
             .unwrap();
         let socket_path = compute_driver_socket_path(&vm_config);
 
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
-            .expect_err("world-writable state dir should be rejected")
-            .to_string();
-        assert!(err.contains("must not be group/world-writable"));
+        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
+
+        let mode = std::fs::metadata(vm_config.state_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]

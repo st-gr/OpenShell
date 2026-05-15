@@ -2,7 +2,7 @@
 
 > Status: Experimental. The VM compute driver is under active development and the interface still has VM-specific plumbing that will be generalized.
 
-Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) for OpenShell. The gateway spawns this binary as a subprocess, talks to it over a Unix domain socket with the `openshell.compute.v1.ComputeDriver` gRPC surface, and lets it manage per-sandbox microVMs. The runtime (libkrun + libkrunfw + gvproxy) and the sandbox supervisor are embedded directly in the binary; each sandbox guest rootfs is derived from a configured container image at create time.
+Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) for OpenShell. The gateway spawns this binary as a subprocess, talks to it over a Unix domain socket with the `openshell.compute.v1.ComputeDriver` gRPC surface, and lets it manage per-sandbox microVMs. The runtime (libkrun + libkrunfw + gvproxy), guest OCI unpacker, and sandbox supervisor are embedded directly in the binary; each sandbox boots from a cached immutable bootstrap ext4 root disk plus a per-sandbox writable overlay disk. When the requested sandbox image differs from the bootstrap image, the driver prepares a read-only image ext4 disk inside a bootstrap VM and mounts that unpacked rootfs as the sandbox lowerdir.
 
 ## How it fits together
 
@@ -35,14 +35,14 @@ Sandbox guests execute `/opt/openshell/bin/openshell-sandbox` as PID 1 inside th
 mise run gateway:vm
 ```
 
-First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/gvproxy and `mise run vm:supervisor` builds the bundled guest supervisor. Subsequent runs are cached.
+First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/gvproxy/umoci and `mise run vm:supervisor` builds the bundled guest supervisor. Subsequent runs are cached.
 
 By default `mise run gateway:vm`:
 
 - Listens on plaintext HTTP at `127.0.0.1:18081`.
 - Registers the CLI gateway `vm-dev` by writing `~/.config/openshell/gateways/vm-dev/metadata.json`. It does not modify the workspace `.env`.
 - Persists the gateway SQLite DB under `.cache/gateway-vm/gateway.db`.
-- Places the VM driver state (per-sandbox rootfs plus `run/compute-driver.sock`) under `/tmp/openshell-vm-driver-$USER-vm-dev/` so the AF_UNIX socket path stays under macOS `SUN_LEN`.
+- Places the VM driver state (per-sandbox `overlay.ext4`, image cache, and `run/compute-driver.sock`) under `/tmp/openshell-vm-driver-$USER-vm-dev/` so the AF_UNIX socket path stays under macOS `SUN_LEN`.
 - Writes `.cache/gateway-vm/gateway.toml` with `[openshell.drivers.vm].driver_dir = "$PWD/target/debug"` so the freshly built `openshell-driver-vm` is used instead of an older installed copy from `~/.local/libexec/openshell`, `/usr/libexec/openshell`, or `/usr/local/libexec`.
 
 For GPU passthrough (VFIO), pass `-- --gpu` and run with root privileges:
@@ -75,6 +75,9 @@ mise run gateway:vm
 
 # custom sandbox image
 OPENSHELL_SANDBOX_IMAGE=ghcr.io/example/sandbox:latest mise run gateway:vm
+
+# custom bootstrap image for the VM runtime used to prepare/boot target images
+OPENSHELL_VM_BOOTSTRAP_IMAGE=ghcr.io/example/bootstrap:latest mise run gateway:vm
 ```
 
 Teardown:
@@ -131,7 +134,22 @@ The gateway resolves `openshell-driver-vm` in this order: `[openshell.drivers.vm
 
 ## Gateway And Driver Configuration
 
-Select the VM driver with `--drivers vm` or `OPENSHELL_DRIVERS=vm`. Configure VM-specific settings in `[openshell.drivers.vm]`: `grpc_endpoint`, `state_dir`, `driver_dir`, `vcpus`, `mem_mib`, `krun_log_level`, and `guest_tls_*`.
+Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_drivers = ["vm"]` in `[openshell.gateway]`. Configure VM-specific settings in `[openshell.drivers.vm]`.
+
+| Configuration key | Default | Purpose |
+|---|---|---|
+| `grpc_endpoint` | empty | Required. URL the sandbox guest dials to reach the gateway. Use `http://host.containers.internal:<port>` (or `host.docker.internal` / `host.openshell.internal`) so traffic flows through gvproxy's host-loopback NAT (HostIP `192.168.127.254` → host `127.0.0.1`). Loopback URLs like `http://127.0.0.1:<port>` are rewritten automatically by the driver. The bare gateway IP (`192.168.127.1`) only carries gvproxy's own services and will not reach host-bound ports. |
+| `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, image cache, and private `run/compute-driver.sock` UDS. |
+| `driver_dir` | unset | Override the directory searched for `openshell-driver-vm`. |
+| `default_image` | OpenShell base image | Sandbox image used when a create request omits one. |
+| `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Defaults to the sandbox image when unset. |
+| `vcpus` | `2` | vCPUs per sandbox. |
+| `mem_mib` | `2048` | Memory per sandbox, in MiB. |
+| `overlay_disk_mib` | `4096` | Sparse writable overlay disk size per sandbox, in MiB. |
+| `krun_log_level` | `1` | libkrun verbosity (0-5). |
+| `guest_tls_ca` | unset | CA cert for the guest's mTLS client bundle. Required when `grpc_endpoint` uses `https://`. |
+| `guest_tls_cert` | unset | Guest client certificate. |
+| `guest_tls_key` | unset | Guest client private key. |
 
 See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the gateway process flag surface.
 
@@ -145,7 +163,31 @@ The gateway is auto-registered by `mise run gateway:vm`. In another terminal:
 ./scripts/bin/openshell sandbox connect demo
 ```
 
-First sandbox takes 10–30 seconds to boot (image fetch/prepare/cache + libkrun + guest init). If `--from` is omitted, the VM driver uses the gateway's configured default sandbox image. Without either `--from` or `--sandbox-image`, VM sandbox creation fails. Subsequent creates reuse the prepared sandbox rootfs.
+First sandbox takes 10–30 seconds to boot (image fetch/prepare/cache + libkrun + guest init). If `--from` is omitted, the VM driver uses the gateway's configured default sandbox image. Without either `--from` or `--sandbox-image`, VM sandbox creation fails. Subsequent creates reuse the prepared image cache and create only a sparse per-sandbox `overlay.ext4` before boot.
+
+`CreateSandbox` accepts the sandbox quickly and continues VM provisioning in the
+background. The driver publishes platform events for image resolution, cache
+hits/misses, layer pulls, rootfs preparation, overlay creation, and VM launcher
+startup so the CLI can show progress through the existing sandbox watch stream.
+
+The VM driver keeps two image caches. The bootstrap cache is a controlled
+`rootfs.ext4` used to boot the guest init and OpenShell supervisor. The prepared
+image cache is used when the requested sandbox image differs from the bootstrap
+image: the host downloads registry layers into a valid OCI layout, attaches that
+payload to a temporary bootstrap VM, and guest init runs `umoci raw unpack` onto
+Linux-owned ext4 storage. The resulting disk is cached under
+`<state-dir>/images/<cache-id>/rootfs.ext4` and attached read-only to later
+sandboxes. Local Docker images are still exported as rootfs tar archives and
+prepared inside the bootstrap VM. Set `OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to
+tune registry layer download parallelism (default `4`, maximum `16`).
+
+Each sandbox gets its own sparse writable
+`<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`
+with the prepared image rootfs as lowerdir when present, otherwise the bootstrap
+rootfs is used directly. Writes to `/sandbox` and other mutable paths land in
+the overlay while cached image disks remain unchanged. The overlay disk must be
+large enough to hold the compressed payload, unpacked rootfs, and sandbox writes
+during the first prepare.
 
 ## Logs and debugging
 
@@ -162,6 +204,7 @@ The VM guest's serial console is appended to `<state-dir>/<sandbox-id>/console.l
 
 - macOS on Apple Silicon, or Linux on aarch64/x86_64 with KVM
 - Rust toolchain
+- e2fsprogs (`mke2fs` or `mkfs.ext4`, plus `debugfs`) for root and overlay disk image creation and QEMU environment injection
 - Guest-supervisor cross-compile toolchain (needed on macOS, and on Linux when host arch ≠ guest arch):
   - Matching rustup target: `rustup target add aarch64-unknown-linux-gnu` (or `x86_64-unknown-linux-gnu` for an amd64 guest)
   - `cargo install --locked cargo-zigbuild` and `brew install zig` (or distro equivalent). `vm:supervisor` uses `cargo zigbuild` to cross-compile the in-VM `openshell-sandbox` supervisor binary.
