@@ -51,10 +51,6 @@ message GetCapabilitiesResponse {
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
-  // True when the driver can provision GPU-backed sandboxes.
-  bool supports_gpu = 4;
-  // Number of GPUs available for sandbox assignment.
-  uint32 gpu_count = 5;
 }
 
 // Driver-owned sandbox model used for create requests and platform observations.

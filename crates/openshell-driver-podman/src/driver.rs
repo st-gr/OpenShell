@@ -169,13 +169,10 @@ impl PodmanComputeDriver {
 
     /// Report driver capabilities.
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, ComputeDriverError> {
-        let supports_gpu = Self::has_gpu_capacity();
         Ok(GetCapabilitiesResponse {
             driver_name: "podman".to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
-            supports_gpu,
-            gpu_count: 0,
         })
     }
 
