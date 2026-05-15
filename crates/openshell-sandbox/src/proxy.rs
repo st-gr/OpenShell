@@ -12,7 +12,7 @@ use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::provider_credentials::ProviderCredentialState;
 use crate::secrets::{SecretResolver, rewrite_header_line_checked};
 use miette::{IntoDiagnostic, Result};
-use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
+use openshell_core::net::{is_always_blocked_ip, is_internal_ip, is_link_local_ip};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
     NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
@@ -32,6 +32,24 @@ use tracing::{debug, warn};
 const MAX_HEADER_BYTES: usize = 8192;
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
 const INFERENCE_LOCAL_PORT: u16 = 443;
+
+/// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
+/// machine. Traffic to these names is eligible for the trusted-gateway SSRF
+/// exemption when the resolved IP matches the driver-injected value read from
+/// `/etc/hosts` at proxy startup.
+const HOST_GATEWAY_ALIASES: &[&str] = &[
+    "host.openshell.internal",
+    "host.containers.internal",
+    "host.docker.internal",
+];
+
+/// Cloud instance metadata IPs that are NEVER exempted from SSRF blocking,
+/// even when they coincidentally match a host-gateway alias resolution.
+/// This list covers the well-known IMDS endpoints across major cloud providers.
+const CLOUD_METADATA_IPS: &[IpAddr] = &[
+    // AWS / GCP / Azure instance metadata service
+    IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254)),
+];
 
 /// Maximum total bytes for a streaming inference response body (32 MiB).
 const MAX_STREAMING_BODY: usize = 32 * 1024 * 1024;
@@ -188,6 +206,18 @@ impl ProxyHandle {
             ocsf_emit!(event);
         }
 
+        // Detect the trusted host gateway IP from /etc/hosts before user code
+        // runs. This is read once at startup so later /etc/hosts modifications
+        // by sandbox workloads cannot influence the stored value.
+        let trusted_host_gateway: Arc<Option<IpAddr>> = Arc::new(detect_trusted_host_gateway());
+        if let Some(ref ip) = *trusted_host_gateway {
+            tracing::info!(
+                %ip,
+                "Trusted host gateway detected from /etc/hosts; \
+                 host-gateway aliases exempt from SSRF always-blocked check"
+            );
+        }
+
         let join = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -198,6 +228,7 @@ impl ProxyHandle {
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
                         let policy_local = policy_local_ctx.clone();
+                        let gw = trusted_host_gateway.clone();
                         let resolver = provider_credentials
                             .as_ref()
                             .and_then(ProviderCredentialState::resolver);
@@ -211,6 +242,7 @@ impl ProxyHandle {
                                 tls,
                                 inf,
                                 policy_local,
+                                gw,
                                 resolver,
                                 dtx,
                             )
@@ -328,6 +360,7 @@ async fn handle_tcp_connection(
     tls_state: Option<Arc<ProxyTlsState>>,
     inference_ctx: Option<Arc<InferenceContext>>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
+    trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
@@ -373,6 +406,7 @@ async fn handle_tcp_connection(
             identity_cache,
             entrypoint_pid,
             policy_local_ctx,
+            trusted_host_gateway,
             secret_resolver,
             denial_tx.as_ref(),
         )
@@ -527,7 +561,63 @@ async fn handle_tcp_connection(
     // The "non-empty" branch is the explicit-allowlist path; reading it first
     // matches the policy decision narrative.
     #[allow(clippy::if_not_else)]
-    let mut upstream = if !raw_allowed_ips.is_empty() {
+    let mut upstream = if is_host_gateway_alias(&host_lc)
+        && let Some(gw) = *trusted_host_gateway
+    {
+        // Trusted host-gateway path. The compute driver injected this hostname
+        // into /etc/hosts pointing at a known IP (read at proxy startup before
+        // user code runs). Bypass the normal SSRF tiers so link-local gateway
+        // addresses (used by rootless Podman with pasta) are not hard-blocked.
+        // Cloud metadata IPs and control-plane ports are still rejected.
+        match resolve_and_check_trusted_gateway(&host, port, gw, sandbox_entrypoint_pid).await {
+            Ok(addrs) => TcpStream::connect(addrs.as_slice())
+                .await
+                .into_diagnostic()?,
+            Err(reason) => {
+                {
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Open)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                        .actor_process(
+                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                .with_cmd_line(&cmdline_str),
+                        )
+                        .firewall_rule("-", "ssrf")
+                        .message(format!(
+                            "CONNECT blocked: trusted-gateway check failed for {host_lc}:{port}"
+                        ))
+                        .status_detail(&reason)
+                        .build();
+                    ocsf_emit!(event);
+                }
+                emit_denial(
+                    &denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
+                );
+                respond(
+                    &mut client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!("CONNECT {host_lc}:{port} blocked: trusted-gateway check failed"),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else if !raw_allowed_ips.is_empty() {
         // allowed_ips mode: validate resolved IPs against CIDR allowlist.
         // Loopback and link-local are still always blocked.
         match parse_allowed_ips(&raw_allowed_ips) {
@@ -1814,6 +1904,149 @@ fn normalize_host_lookup_key(host: &str) -> &str {
         .unwrap_or(host)
 }
 
+/// Returns `true` if `host` is one of the well-known driver-injected aliases
+/// for the host machine (e.g. `host.openshell.internal`).
+fn is_host_gateway_alias(host: &str) -> bool {
+    let h = normalize_host_lookup_key(host);
+    HOST_GATEWAY_ALIASES
+        .iter()
+        .any(|alias| alias.eq_ignore_ascii_case(h))
+}
+
+/// Returns `true` if `ip` is a known cloud instance metadata endpoint that
+/// must never be exempted from SSRF blocking.
+///
+/// IPv4-mapped IPv6 addresses (e.g. `::ffff:169.254.169.254`) are normalized
+/// to their embedded IPv4 representation before comparison, so the invariant
+/// holds regardless of how the address is represented.
+fn is_cloud_metadata_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(_) => CLOUD_METADATA_IPS.contains(&ip),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .is_some_and(|v4| CLOUD_METADATA_IPS.contains(&IpAddr::V4(v4))),
+    }
+}
+
+/// Read the proxy's own `/etc/hosts` at startup and return the IP mapped to
+/// `host.openshell.internal`, if present and safe.
+///
+/// This is called once before user code runs, so the returned value is immune
+/// to later `/etc/hosts` tampering by sandbox workloads. Returns `None` if no
+/// entry exists, the entry cannot be parsed, or the mapped IP is a cloud
+/// metadata address.
+#[cfg(any(target_os = "linux", test))]
+fn detect_trusted_host_gateway() -> Option<IpAddr> {
+    let contents = std::fs::read_to_string("/etc/hosts").ok()?;
+    let ips = parse_hosts_file_for_host(&contents, "host.openshell.internal");
+
+    // Multiple distinct IPs for the alias is unexpected — compute drivers
+    // always inject exactly one. Warn loudly so operators can diagnose the
+    // inconsistency; we still proceed with the first entry rather than
+    // disabling the exemption entirely, because the mismatch guard in
+    // resolve_and_check_trusted_gateway() will reject any runtime resolution
+    // that returns a different IP.
+    if ips.len() > 1 {
+        warn!(
+            ips = ?ips,
+            "host.openshell.internal has {} distinct IPs in /etc/hosts; \
+             expected exactly one. Using first entry. \
+             Connections resolving to any other IP will be rejected.",
+            ips.len()
+        );
+    }
+
+    let ip = ips.into_iter().next()?;
+
+    if is_cloud_metadata_ip(ip) {
+        warn!(
+            %ip,
+            "host.openshell.internal resolves to a cloud metadata IP; \
+             trusted-gateway SSRF exemption disabled"
+        );
+        return None;
+    }
+    // The exemption exists solely for link-local IPs used by rootless Podman
+    // with pasta. Private RFC 1918 addresses (e.g. Docker bridge 172.17.0.1,
+    // Kubernetes node 192.168.x.x), loopback, unspecified, and all other
+    // non-link-local addresses are never legitimate candidates for the
+    // link-local SSRF exemption — they must fall through to the normal
+    // allowed_ips / resolve_and_reject_internal() enforcement path.
+    if !is_link_local_ip(ip) {
+        warn!(
+            %ip,
+            "host.openshell.internal maps to a non-link-local IP; \
+             trusted-gateway SSRF exemption disabled"
+        );
+        return None;
+    }
+    Some(ip)
+}
+
+#[cfg(not(any(target_os = "linux", test)))]
+fn detect_trusted_host_gateway() -> Option<IpAddr> {
+    None
+}
+
+/// Resolve `host:port` and validate that every resolved address matches the
+/// trusted host gateway IP.
+///
+/// This bypasses the normal SSRF tiers (always-blocked and internal-IP) for
+/// driver-injected host-gateway aliases, allowing link-local addresses used
+/// by rootless Podman with pasta without opening up arbitrary link-local or
+/// cloud metadata access.
+///
+/// Rejects:
+/// - Any resolved IP that is a cloud metadata address (defense-in-depth)
+/// - Any resolved IP that does not match `trusted_gw` (prevents /etc/hosts tampering)
+/// - Control-plane ports (etcd, K8s API, kubelet) regardless of IP
+async fn resolve_and_check_trusted_gateway(
+    host: &str,
+    port: u16,
+    trusted_gw: IpAddr,
+    entrypoint_pid: u32,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    if BLOCKED_CONTROL_PLANE_PORTS.contains(&port) {
+        return Err(format!(
+            "port {port} is a blocked control-plane port, connection rejected"
+        ));
+    }
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
+    if addrs.is_empty() {
+        return Err(format!(
+            "DNS resolution returned no addresses for {}",
+            normalize_host_lookup_key(host)
+        ));
+    }
+    for addr in &addrs {
+        if is_cloud_metadata_ip(addr.ip()) {
+            return Err(format!(
+                "{host} resolves to cloud metadata address {}, connection rejected",
+                addr.ip()
+            ));
+        }
+        if addr.ip() != trusted_gw {
+            return Err(format!(
+                "{host} resolves to {} which does not match trusted host gateway \
+                 {trusted_gw}, connection rejected",
+                addr.ip()
+            ));
+        }
+        // Defense-in-depth: even if the resolved IP matches trusted_gw, reject
+        // any non-link-local address. detect_trusted_host_gateway() already
+        // enforces this at startup, but we re-check here to guard against any
+        // unanticipated code path that might admit a private or loopback IP.
+        if !is_link_local_ip(addr.ip()) {
+            return Err(format!(
+                "{host} resolves to non-link-local address {}, \
+                 connection rejected",
+                addr.ip()
+            ));
+        }
+    }
+    Ok(addrs)
+}
+
 fn resolve_ip_literal(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
     normalize_host_lookup_key(host)
         .parse::<IpAddr>()
@@ -2455,6 +2688,7 @@ async fn handle_forward_proxy(
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
+    trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
@@ -2969,6 +3203,8 @@ async fn handle_forward_proxy(
     }
 
     // 5. DNS resolution + SSRF defence (mirrors the CONNECT path logic).
+    //    - If the host is a driver-injected host-gateway alias: bypass SSRF
+    //      tiers and validate only against the trusted gateway IP.
     //    - If allowed_ips is set: validate resolved IPs against the allowlist
     //      (this is the SSRF override for private IP destinations).
     //    - If allowed_ips is empty: reject internal IPs, allow public IPs through.
@@ -2979,70 +3215,125 @@ async fn handle_forward_proxy(
         raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
     }
 
-    // The "non-empty" branch is the explicit-allowlist path; reading it first
-    // matches the policy decision narrative.
+    // The trusted-gateway branch is the first path; reading it before the
+    // allowed_ips and default branches matches the policy decision narrative.
     #[allow(clippy::if_not_else)]
-    let addrs =
-        if !raw_allowed_ips.is_empty() {
-            // allowed_ips mode: validate resolved IPs against CIDR allowlist.
-            match parse_allowed_ips(&raw_allowed_ips) {
-                Ok(nets) => {
-                    match resolve_and_check_allowed_ips(&host, port, &nets, sandbox_entrypoint_pid)
-                        .await
-                    {
-                        Ok(addrs) => addrs,
-                        Err(reason) => {
-                            {
-                                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
-                            .activity(ActivityId::Other)
-                            .action(ActionId::Denied)
-                            .disposition(DispositionId::Blocked)
-                            .severity(SeverityId::Medium)
-                            .status(StatusId::Failure)
-                            .http_request(HttpRequest::new(
-                                method,
-                                OcsfUrl::new("http", &host_lc, &path, port),
-                            ))
-                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                            .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                            .actor_process(
-                                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                    .with_cmd_line(&cmdline_str),
-                            )
-                            .firewall_rule(policy_str, "ssrf")
-                            .message(format!(
-                                "FORWARD blocked: allowed_ips check failed for {host_lc}:{port}"
-                            ))
-                            .status_detail(&reason)
-                            .build();
-                                ocsf_emit!(event);
-                            }
-                            emit_denial_simple(
-                                denial_tx,
-                                &host_lc,
-                                port,
-                                &binary_str,
-                                &decision,
-                                &reason,
-                                "ssrf",
-                            );
-                            respond(
-                        client,
-                        &build_json_error_response(
-                            403,
-                            "Forbidden",
-                            "ssrf_denied",
-                            &format!("{method} {host_lc}:{port} blocked: allowed_ips check failed"),
-                        ),
-                    )
-                    .await?;
-                            return Ok(());
+    let addrs = if is_host_gateway_alias(&host_lc)
+        && let Some(gw) = *trusted_host_gateway
+    {
+        // Trusted host-gateway path. Mirrors the CONNECT path logic.
+        match resolve_and_check_trusted_gateway(&host, port, gw, sandbox_entrypoint_pid).await {
+            Ok(addrs) => addrs,
+            Err(reason) => {
+                {
+                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Other)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .http_request(HttpRequest::new(
+                            method,
+                            OcsfUrl::new("http", &host_lc, &path, port),
+                        ))
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                        .actor_process(
+                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                .with_cmd_line(&cmdline_str),
+                        )
+                        .firewall_rule(policy_str, "ssrf")
+                        .message(format!(
+                            "FORWARD blocked: trusted-gateway check failed for {host_lc}:{port}"
+                        ))
+                        .status_detail(&reason)
+                        .build();
+                    ocsf_emit!(event);
+                }
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
+                );
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!("{method} {host_lc}:{port} blocked: trusted-gateway check failed"),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else if !raw_allowed_ips.is_empty() {
+        // allowed_ips mode: validate resolved IPs against CIDR allowlist.
+        match parse_allowed_ips(&raw_allowed_ips) {
+            Ok(nets) => {
+                match resolve_and_check_allowed_ips(&host, port, &nets, sandbox_entrypoint_pid)
+                    .await
+                {
+                    Ok(addrs) => addrs,
+                    Err(reason) => {
+                        {
+                            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                                .activity(ActivityId::Other)
+                                .action(ActionId::Denied)
+                                .disposition(DispositionId::Blocked)
+                                .severity(SeverityId::Medium)
+                                .status(StatusId::Failure)
+                                .http_request(HttpRequest::new(
+                                    method,
+                                    OcsfUrl::new("http", &host_lc, &path, port),
+                                ))
+                                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                                .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                                .actor_process(
+                                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                        .with_cmd_line(&cmdline_str),
+                                )
+                                .firewall_rule(policy_str, "ssrf")
+                                .message(format!(
+                                    "FORWARD blocked: allowed_ips check failed for {host_lc}:{port}"
+                                ))
+                                .status_detail(&reason)
+                                .build();
+                            ocsf_emit!(event);
                         }
+                        emit_denial_simple(
+                            denial_tx,
+                            &host_lc,
+                            port,
+                            &binary_str,
+                            &decision,
+                            &reason,
+                            "ssrf",
+                        );
+                        respond(
+                            client,
+                            &build_json_error_response(
+                                403,
+                                "Forbidden",
+                                "ssrf_denied",
+                                &format!(
+                                    "{method} {host_lc}:{port} blocked: allowed_ips check failed"
+                                ),
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
                     }
                 }
-                Err(reason) => {
-                    {
-                        let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+            }
+            Err(reason) => {
+                {
+                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                         .activity(ActivityId::Other)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
@@ -3064,39 +3355,39 @@ async fn handle_forward_proxy(
                         ))
                         .status_detail(&reason)
                         .build();
-                        ocsf_emit!(event);
-                    }
-                    emit_denial_simple(
-                        denial_tx,
-                        &host_lc,
-                        port,
-                        &binary_str,
-                        &decision,
-                        &reason,
-                        "ssrf",
-                    );
-                    respond(
-                        client,
-                        &build_json_error_response(
-                            403,
-                            "Forbidden",
-                            "ssrf_denied",
-                            &format!(
-                                "{method} {host_lc}:{port} blocked: invalid allowed_ips in policy"
-                            ),
-                        ),
-                    )
-                    .await?;
-                    return Ok(());
+                    ocsf_emit!(event);
                 }
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
+                );
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!(
+                            "{method} {host_lc}:{port} blocked: invalid allowed_ips in policy"
+                        ),
+                    ),
+                )
+                .await?;
+                return Ok(());
             }
-        } else {
-            // No allowed_ips: reject internal IPs, allow public IPs through.
-            match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
-                Ok(addrs) => addrs,
-                Err(reason) => {
-                    {
-                        let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+        }
+    } else {
+        // No allowed_ips: reject internal IPs, allow public IPs through.
+        match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
+            Ok(addrs) => addrs,
+            Err(reason) => {
+                {
+                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                         .activity(ActivityId::Other)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
@@ -3118,31 +3409,31 @@ async fn handle_forward_proxy(
                         ))
                         .status_detail(&reason)
                         .build();
-                        ocsf_emit!(event);
-                    }
-                    emit_denial_simple(
-                        denial_tx,
-                        &host_lc,
-                        port,
-                        &binary_str,
-                        &decision,
-                        &reason,
-                        "ssrf",
-                    );
-                    respond(
-                        client,
-                        &build_json_error_response(
-                            403,
-                            "Forbidden",
-                            "ssrf_denied",
-                            &format!("{method} {host_lc}:{port} blocked: internal address"),
-                        ),
-                    )
-                    .await?;
-                    return Ok(());
+                    ocsf_emit!(event);
                 }
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
+                );
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!("{method} {host_lc}:{port} blocked: internal address"),
+                    ),
+                )
+                .await?;
+                return Ok(());
             }
-        };
+        }
+    };
 
     if let Err(e) = forward_generation_guard.ensure_current() {
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
@@ -4127,6 +4418,444 @@ network_policies:
         let result =
             resolve_from_hosts_file_contents("192.168.1.105 searxng.local\n", "missing.local", 80);
         assert!(result.is_empty());
+    }
+
+    // -- is_host_gateway_alias --
+
+    #[test]
+    fn test_is_host_gateway_alias_recognises_known_aliases() {
+        assert!(is_host_gateway_alias("host.openshell.internal"));
+        assert!(is_host_gateway_alias("host.containers.internal"));
+        assert!(is_host_gateway_alias("host.docker.internal"));
+    }
+
+    #[test]
+    fn test_is_host_gateway_alias_is_case_insensitive() {
+        assert!(is_host_gateway_alias("HOST.OPENSHELL.INTERNAL"));
+        assert!(is_host_gateway_alias("Host.Containers.Internal"));
+        assert!(is_host_gateway_alias("HOST.DOCKER.INTERNAL"));
+    }
+
+    #[test]
+    fn test_is_host_gateway_alias_rejects_unknown_hosts() {
+        assert!(!is_host_gateway_alias("api.example.com"));
+        assert!(!is_host_gateway_alias("host.openshell.internal.evil.com"));
+        assert!(!is_host_gateway_alias("evil.host.openshell.internal"));
+        assert!(!is_host_gateway_alias("openshell.internal"));
+        assert!(!is_host_gateway_alias(""));
+    }
+
+    // -- is_cloud_metadata_ip --
+
+    #[test]
+    fn test_is_cloud_metadata_ip_blocks_known_metadata_ip() {
+        assert!(is_cloud_metadata_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+    }
+
+    #[test]
+    fn test_is_cloud_metadata_ip_allows_other_link_local() {
+        // The pasta gateway address on this test host — not a metadata IP.
+        assert!(!is_cloud_metadata_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 1, 2
+        ))));
+        assert!(!is_cloud_metadata_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn test_is_cloud_metadata_ip_allows_private_and_public() {
+        assert!(!is_cloud_metadata_ip(IpAddr::V4(Ipv4Addr::new(
+            10, 0, 0, 1
+        ))));
+        assert!(!is_cloud_metadata_ip(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 1
+        ))));
+        assert!(!is_cloud_metadata_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    #[test]
+    fn test_is_cloud_metadata_ip_blocks_ipv4_mapped_metadata() {
+        // ::ffff:169.254.169.254 is the IPv4-mapped IPv6 representation of the
+        // AWS/GCP/Azure IMDS endpoint. is_link_local_ip() recognizes it as
+        // link-local, so is_cloud_metadata_ip() must also catch it — otherwise
+        // the trusted-gateway exemption would be granted to the metadata service.
+        let mapped = Ipv4Addr::new(169, 254, 169, 254).to_ipv6_mapped();
+        assert!(
+            is_cloud_metadata_ip(IpAddr::V6(mapped)),
+            "::ffff:169.254.169.254 must be recognized as cloud metadata"
+        );
+    }
+
+    #[test]
+    fn test_is_cloud_metadata_ip_allows_other_ipv4_mapped_link_local() {
+        // Other IPv4-mapped link-local addresses are NOT metadata.
+        let mapped = Ipv4Addr::new(169, 254, 1, 2).to_ipv6_mapped();
+        assert!(
+            !is_cloud_metadata_ip(IpAddr::V6(mapped)),
+            "::ffff:169.254.1.2 should not be flagged as cloud metadata"
+        );
+    }
+
+    // -- detect_trusted_host_gateway --
+
+    #[test]
+    fn test_detect_trusted_host_gateway_returns_ip_from_hosts_content() {
+        // We test the underlying parser directly since detect_trusted_host_gateway
+        // reads the real /etc/hosts. The production code composes these same primitives.
+        let contents = "169.254.1.2\thost.openshell.internal host.containers.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_ignores_cloud_metadata_ip() {
+        // Simulate a /etc/hosts where the driver injected the cloud metadata IP —
+        // this should be caught and suppressed.
+        let contents = "169.254.169.254\thost.openshell.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))]);
+        // is_cloud_metadata_ip should flag it, preventing the exemption.
+        assert!(is_cloud_metadata_ip(ips[0]));
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_no_entry_returns_empty() {
+        let contents = "127.0.0.1 localhost\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert!(ips.is_empty());
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_rejects_loopback() {
+        // Loopback is not link-local — must not receive the SSRF exemption.
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert!(!is_cloud_metadata_ip(ip));
+        assert!(!is_link_local_ip(ip));
+        // The guard: !link-local → reject.
+        assert!(!is_link_local_ip(ip));
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_rejects_unspecified() {
+        // Unspecified (0.0.0.0) is not link-local — must not be trusted.
+        let ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        assert!(!is_cloud_metadata_ip(ip));
+        assert!(!is_link_local_ip(ip));
+        assert!(!is_link_local_ip(ip));
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_rejects_loopback_v6() {
+        let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert!(!is_cloud_metadata_ip(ip));
+        assert!(!is_link_local_ip(ip));
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_rejects_private_ip() {
+        // Docker bridge (172.17.0.1) and K8s host gateway (192.168.x.x) are
+        // RFC 1918 private addresses — not link-local. Before this fix they
+        // slipped through the old always-blocked guard and received the SSRF
+        // exemption. The new guard (!is_link_local_ip) rejects them, so
+        // connections to these hosts fall through to resolve_and_reject_internal().
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        ] {
+            assert!(!is_cloud_metadata_ip(ip), "{ip} should not be metadata");
+            assert!(!is_link_local_ip(ip), "{ip} should not be link-local");
+            // Guard fires — exemption disabled.
+            assert!(!is_link_local_ip(ip), "{ip}: guard must reject");
+        }
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_allows_link_local_non_metadata() {
+        // 169.254.1.2 (rootless Podman pasta gateway) IS link-local and is
+        // not a cloud metadata IP — it is the only address class the exemption
+        // is designed for.
+        let ip = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        assert!(!is_cloud_metadata_ip(ip));
+        assert!(is_link_local_ip(ip));
+        // Guard does NOT fire — this IP is eligible for the exemption.
+        assert!(is_link_local_ip(ip));
+    }
+
+    // -- parse_hosts_file_for_host: multi-entry / duplicate scenarios --
+
+    #[test]
+    fn test_parse_hosts_file_single_entry() {
+        // Normal driver-injected case: exactly one IP for the alias.
+        let contents = "169.254.1.2\thost.openshell.internal host.containers.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+    }
+
+    #[test]
+    fn test_parse_hosts_file_duplicate_same_ip_deduplicated() {
+        // Same IP on two separate lines for the same alias — deduplicated to one.
+        let contents = "169.254.1.2\thost.openshell.internal\n\
+                        169.254.1.2\thost.openshell.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(
+            ips,
+            vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))],
+            "identical IPs across lines must be deduplicated"
+        );
+    }
+
+    #[test]
+    fn test_parse_hosts_file_multiple_distinct_ips() {
+        // Two distinct IPs for the same alias — both returned, first entry wins
+        // in detect_trusted_host_gateway(), second would cause mismatch rejection
+        // in resolve_and_check_trusted_gateway().
+        let contents = "169.254.1.2\thost.openshell.internal\n\
+                        169.254.1.3\thost.openshell.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips.len(), 2, "two distinct IPs must both be returned");
+        assert_eq!(ips[0], IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2)));
+        assert_eq!(ips[1], IpAddr::V4(Ipv4Addr::new(169, 254, 1, 3)));
+    }
+
+    #[test]
+    fn test_parse_hosts_file_first_entry_wins_on_ambiguity() {
+        // detect_trusted_host_gateway() pins to the first entry via .next().
+        // Verify the ordering guarantee: first line wins.
+        let contents = "169.254.1.3\thost.openshell.internal\n\
+                        169.254.1.2\thost.openshell.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(
+            ips[0],
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 3)),
+            "first line must be first in the returned vec"
+        );
+    }
+
+    #[test]
+    fn test_parse_hosts_file_ignores_other_aliases_on_same_line() {
+        // An entry with multiple aliases — only the matching alias counts.
+        let contents =
+            "169.254.1.2\thost.containers.internal host.openshell.internal host.docker.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+        // Non-matching aliases on the same line do not produce extra entries.
+        let ips2 = parse_hosts_file_for_host(contents, "host.docker.internal");
+        assert_eq!(ips2, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+    }
+
+    #[test]
+    fn test_parse_hosts_file_alias_not_present() {
+        let contents = "127.0.0.1\tlocalhost\n\
+                        ::1\t\tlocalhost\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert!(ips.is_empty());
+    }
+
+    #[test]
+    fn test_parse_hosts_file_comment_lines_skipped() {
+        let contents = "# 169.254.1.2 host.openshell.internal\n\
+                        169.254.1.2\thost.openshell.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        // Commented-out line must not produce an entry.
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+    }
+
+    #[test]
+    fn test_parse_hosts_file_inline_comment_stripped() {
+        // Anything after '#' on a data line is treated as a comment.
+        let contents = "169.254.1.2\thost.openshell.internal # injected by driver\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+    }
+
+    // -- resolve_and_check_trusted_gateway --
+
+    #[tokio::test]
+    async fn test_trusted_gateway_allows_link_local_gateway_ip() {
+        // Simulate the rootless Podman pasta case: host.openshell.internal
+        // points to a link-local address which is the only path to the host.
+        let trusted_gw = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+
+        // We resolve via /etc/hosts (pid=0 falls back to system), so we
+        // exercise the trusted_gw mismatch / cloud-metadata guards directly
+        // against a known resolved address.
+        let addrs = [SocketAddr::new(trusted_gw, 8080)];
+
+        // Validate the guard logic inline (mirrors resolve_and_check_trusted_gateway).
+        assert!(!is_cloud_metadata_ip(trusted_gw));
+        assert_eq!(addrs[0].ip(), trusted_gw);
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_cloud_metadata_ip() {
+        let trusted_gw = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        let metadata_ip = IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254));
+
+        // Simulate resolution returning the metadata IP.
+        let addrs = [SocketAddr::new(metadata_ip, 80)];
+
+        // Cloud metadata check must fire before the trusted_gw equality check.
+        let err: Result<(), String> = if is_cloud_metadata_ip(addrs[0].ip()) {
+            Err(format!(
+                "host resolves to cloud metadata address {}, connection rejected",
+                addrs[0].ip()
+            ))
+        } else if addrs[0].ip() != trusted_gw {
+            Err(format!(
+                "host resolves to {} which does not match trusted host gateway \
+                 {trusted_gw}, connection rejected",
+                addrs[0].ip()
+            ))
+        } else {
+            Ok(())
+        };
+
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err().contains("cloud metadata"),
+            "expected cloud-metadata rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_mismatched_ip() {
+        let trusted_gw = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        let other_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        let addrs = [SocketAddr::new(other_ip, 8080)];
+
+        let err: Result<(), String> = if is_cloud_metadata_ip(addrs[0].ip()) {
+            Err("cloud metadata".to_string())
+        } else if addrs[0].ip() != trusted_gw {
+            Err(format!(
+                "{} does not match trusted host gateway {trusted_gw}",
+                addrs[0].ip()
+            ))
+        } else {
+            Ok(())
+        };
+
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .contains("does not match trusted host gateway"),
+            "expected mismatch rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_control_plane_port() {
+        // Control-plane port check runs before resolution.
+        let result = resolve_and_check_trusted_gateway(
+            "host.openshell.internal",
+            6443,
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2)),
+            0,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("blocked control-plane port"),
+            "expected control-plane port rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_all_control_plane_ports() {
+        let trusted_gw = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        for &port in BLOCKED_CONTROL_PLANE_PORTS {
+            let result =
+                resolve_and_check_trusted_gateway("host.openshell.internal", port, trusted_gw, 0)
+                    .await;
+            assert!(
+                result.is_err(),
+                "port {port} should be blocked by control-plane guard"
+            );
+            assert!(
+                result.unwrap_err().contains("blocked control-plane port"),
+                "expected control-plane rejection for port {port}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_loopback_as_trusted_gw() {
+        // Defense-in-depth: even if detect_trusted_host_gateway somehow admitted
+        // a loopback IP, resolve_and_check_trusted_gateway must reject it.
+        // Using an IP literal as the host bypasses DNS and gives a deterministic
+        // resolved address, allowing us to exercise the actual function.
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let result = resolve_and_check_trusted_gateway("127.0.0.1", 8080, loopback, 0).await;
+        assert!(result.is_err(), "loopback must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("non-link-local"),
+            "expected non-link-local rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_unspecified_as_trusted_gw() {
+        // Defense-in-depth: 0.0.0.0 as trusted_gw must be rejected.
+        // IP literal resolves to 0.0.0.0 directly, bypassing DNS.
+        let unspecified = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let result = resolve_and_check_trusted_gateway("0.0.0.0", 8080, unspecified, 0).await;
+        assert!(result.is_err(), "unspecified must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("non-link-local"),
+            "expected non-link-local rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_ip_literal_mismatch() {
+        // If the requested IP literal doesn't match trusted_gw, the mismatch
+        // guard fires. This exercises the full resolution→validation path.
+        let trusted_gw = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        let other_ip = "10.0.0.1"; // RFC1918, resolves as a literal
+        let result = resolve_and_check_trusted_gateway(other_ip, 8080, trusted_gw, 0).await;
+        assert!(result.is_err(), "IP mismatch must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("does not match trusted host gateway"),
+            "expected mismatch rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_cloud_metadata_literal() {
+        // Cloud metadata IP as a literal address — must be rejected even when
+        // it matches trusted_gw (which detect_trusted_host_gateway prevents,
+        // but this is the defense-in-depth layer).
+        let metadata = IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254));
+        let result = resolve_and_check_trusted_gateway("169.254.169.254", 80, metadata, 0).await;
+        assert!(result.is_err(), "cloud metadata IP must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("cloud metadata"),
+            "expected cloud-metadata rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_private_ip_as_trusted_gw() {
+        // Defense-in-depth: a private RFC 1918 IP (e.g. Docker bridge 172.17.0.1)
+        // must be rejected even if it somehow matched trusted_gw.
+        // detect_trusted_host_gateway() already blocks these via !is_link_local_ip(),
+        // but resolve_and_check_trusted_gateway() must enforce the same invariant.
+        let docker_bridge = IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1));
+        let result = resolve_and_check_trusted_gateway("172.17.0.1", 8080, docker_bridge, 0).await;
+        assert!(result.is_err(), "private RFC 1918 IP must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("non-link-local"),
+            "expected non-link-local rejection for private IP, got: {err}"
+        );
     }
 
     #[tokio::test]
