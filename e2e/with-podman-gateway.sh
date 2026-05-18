@@ -11,8 +11,8 @@
 #   - OPENSHELL_GATEWAY_ENDPOINT=http://host:port:
 #       Use the existing plaintext gateway endpoint and run the command.
 #
-# Podman e2e currently uses plaintext gateway traffic. The Podman driver does
-# not yet inject gateway mTLS client materials into sandbox containers.
+# HTTPS endpoint-only mode is intentionally unsupported here. Use a named
+# gateway config when mTLS materials are needed.
 
 set -euo pipefail
 
@@ -277,12 +277,12 @@ if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
   case "${OPENSHELL_GATEWAY_ENDPOINT}" in
     http://*) ;;
     https://*)
-      echo "ERROR: OPENSHELL_GATEWAY_ENDPOINT endpoint mode is HTTP-only for Podman e2e." >&2
-      echo "       Podman e2e does not yet support sandbox mTLS client material injection." >&2
+      echo "ERROR: OPENSHELL_GATEWAY_ENDPOINT endpoint mode is HTTP-only for e2e." >&2
+      echo "       Register a named gateway with mTLS config instead of using a raw HTTPS endpoint." >&2
       exit 2
       ;;
     *)
-      echo "ERROR: OPENSHELL_GATEWAY_ENDPOINT must start with http:// for Podman e2e endpoint mode." >&2
+      echo "ERROR: OPENSHELL_GATEWAY_ENDPOINT must start with http:// for e2e endpoint mode." >&2
       exit 2
       ;;
   esac
@@ -328,6 +328,9 @@ if ! podman_cmd image exists "${SANDBOX_IMAGE}" 2>/dev/null; then
   podman_cmd pull "${SANDBOX_IMAGE}"
 fi
 
+PKI_DIR="${WORKDIR}/pki"
+e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}" "host.containers.internal"
+
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
 STATE_DIR="${WORKDIR}/state"
@@ -366,6 +369,9 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf 'default_image = %s\n'  "$(toml_string "${SANDBOX_IMAGE}")"
   printf 'image_pull_policy = "missing"\n'
   printf 'supervisor_image = %s\n' "$(toml_string "${SUPERVISOR_IMAGE}")"
+  printf 'guest_tls_ca = %s\n'     "$(toml_string "${PKI_DIR}/ca.crt")"
+  printf 'guest_tls_cert = %s\n'   "$(toml_string "${PKI_DIR}/client/tls.crt")"
+  printf 'guest_tls_key = %s\n'    "$(toml_string "${PKI_DIR}/client/tls.key")"
   # The in-process Podman driver reads `socket_path` from TOML only — the
   # OPENSHELL_PODMAN_SOCKET env var is honoured by the standalone driver
   # binary, not the in-process driver used here. Pin the socket to the one
@@ -382,7 +388,9 @@ GATEWAY_ARGS=(
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
   --drivers podman
-  --disable-tls
+  --tls-cert "${PKI_DIR}/server/tls.crt"
+  --tls-key "${PKI_DIR}/server/tls.key"
+  --tls-client-ca "${PKI_DIR}/ca.crt"
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
   --log-level info
 )
@@ -401,12 +409,13 @@ GATEWAY_PID=$!
 printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"
 
 GATEWAY_NAME="openshell-e2e-podman-${HOST_PORT}"
-CLI_GATEWAY_ENDPOINT="http://127.0.0.1:${HOST_PORT}"
-e2e_register_plaintext_gateway \
+CLI_GATEWAY_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
+e2e_register_mtls_gateway \
   "${XDG_CONFIG_HOME}" \
   "${GATEWAY_NAME}" \
   "${CLI_GATEWAY_ENDPOINT}" \
-  "${HOST_PORT}"
+  "${HOST_PORT}" \
+  "${PKI_DIR}"
 
 export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
 export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
