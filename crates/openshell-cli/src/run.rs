@@ -6708,6 +6708,13 @@ pub async fn sandbox_draft_get(
                 chunk.security_notes.yellow()
             );
         }
+        if !chunk.validation_result.is_empty() {
+            println!(
+                "  {} {}",
+                "Validation:".dimmed(),
+                chunk.validation_result.cyan()
+            );
+        }
 
         if let Some(ref rule) = chunk.proposed_rule {
             println!("  {} {}", "Endpoints:".dimmed(), format_endpoints(rule));
