@@ -48,6 +48,18 @@ jobs:
       platform: linux/arm64
       publish-manifest: false
 
+  build-cli:
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: cli
+      platform: linux/amd64
+    secrets: inherit
+
   e2e:
     needs: [pr_metadata, build-gateway, build-supervisor]
     if: needs.pr_metadata.outputs.should_run == 'true'

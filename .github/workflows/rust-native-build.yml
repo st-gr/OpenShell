@@ -1,18 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Rust Image Binary Build (openshell-gateway / openshell-sandbox)
+name: Rust Image Binary Build (openshell-gateway / openshell-sandbox / openshell-cli)
 
 # Build Rust binaries per Linux architecture before the Docker image build
 # consumes them as prebuilt artifacts. Gateway images use GNU-linked binaries
-# for the NVIDIA distroless C/C++ runtime; supervisor images use musl/static
+# for the NVIDIA distroless C/C++ runtime; supervisor and cli images use musl/static
 # binaries so the final image can remain scratch.
 
 on:
   workflow_call:
     inputs:
       component:
-        description: "Binary component to build (gateway or sandbox)"
+        description: "Binary component to build (gateway, sandbox, or cli)"
         required: true
         type: string
       arch:
@@ -114,6 +114,11 @@ jobs:
               binary=openshell-sandbox
               zig_target=
               ;;
+            cli)
+              crate=openshell-cli
+              binary=openshell
+              zig_target=
+              ;;
             *)
               echo "unsupported component: $COMPONENT" >&2
               exit 1
@@ -122,7 +127,7 @@ jobs:
 
           case "$ARCH" in
             amd64)
-              if [[ "$COMPONENT" == "sandbox" ]]; then
+              if [[ "$COMPONENT" == "sandbox" || "$COMPONENT" == "cli" ]]; then
                 target=x86_64-unknown-linux-musl
                 zig_target=x86_64-linux-musl
               else
@@ -130,7 +135,7 @@ jobs:
               fi
               ;;
             arm64)
-              if [[ "$COMPONENT" == "sandbox" ]]; then
+              if [[ "$COMPONENT" == "sandbox" || "$COMPONENT" == "cli" ]]; then
                 target=aarch64-unknown-linux-musl
                 zig_target=aarch64-linux-musl
               else
@@ -201,6 +206,12 @@ jobs:
           echo "CXX_${TARGET_ENV}=/tmp/zig-musl/c++" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=/tmp/zig-musl/cc" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_${TARGET_ENV_UPPER}_RUSTFLAGS=-Clink-self-contained=no" >> "$GITHUB_ENV"
+
+          # z3 built with zig c++ uses libc++ symbols (std::__1::*).
+          # Override z3-sys default (stdc++) so Rust links the matching runtime.
+          if [[ "$COMPONENT" == "cli" ]]; then
+            echo "CXXSTDLIB=c++" >> "$GITHUB_ENV"
+          fi
 
       - name: Build ${{ steps.target.outputs.binary }} (${{ steps.target.outputs.target }})
         env:
