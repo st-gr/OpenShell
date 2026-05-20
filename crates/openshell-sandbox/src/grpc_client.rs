@@ -10,10 +10,10 @@ use std::time::Duration;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
-    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, PolicyChunk, PolicySource,
-    PolicyStatus, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
-    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
-    inference_client::InferenceClient, open_shell_client::OpenShellClient,
+    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, NetworkActivitySummary,
+    PolicyChunk, PolicySource, PolicyStatus, ReportPolicyStatusRequest,
+    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    UpdateConfigRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
@@ -310,6 +310,7 @@ impl CachedOpenShellClient {
         sandbox_name: &str,
         summaries: Vec<DenialSummary>,
         proposed_chunks: Vec<PolicyChunk>,
+        network_activity_summaries: Vec<NetworkActivitySummary>,
         analysis_mode: &str,
     ) -> Result<SubmitPolicyAnalysisResponse> {
         let response = self
@@ -319,6 +320,7 @@ impl CachedOpenShellClient {
                 name: sandbox_name.to_string(),
                 summaries,
                 proposed_chunks,
+                network_activity_summaries,
                 analysis_mode: analysis_mode.to_string(),
             })
             .await

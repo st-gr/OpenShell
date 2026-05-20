@@ -76,6 +76,42 @@ const GLOBAL_POLICY_SANDBOX_ID: &str = "__global__";
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
 
+fn emit_sandbox_policy_update_success() {
+    openshell_core::telemetry::emit_lifecycle("sandbox_policy", "update", "success");
+}
+
+fn emit_sandbox_policy_update_failure() {
+    openshell_core::telemetry::emit_lifecycle("sandbox_policy", "update", "failure");
+}
+
+fn should_emit_config_update_policy_telemetry(sandbox_caller: bool) -> bool {
+    !sandbox_caller
+}
+
+fn emit_config_update_policy_success(sandbox_caller: bool) {
+    if should_emit_config_update_policy_telemetry(sandbox_caller) {
+        emit_sandbox_policy_update_success();
+    }
+}
+
+fn should_emit_full_policy_update_telemetry(sandbox_caller: bool, next_version: i64) -> bool {
+    !sandbox_caller && next_version > 1
+}
+
+fn emit_full_policy_update_success(sandbox_caller: bool, next_version: i64) {
+    if should_emit_full_policy_update_telemetry(sandbox_caller, next_version) {
+        emit_sandbox_policy_update_success();
+    }
+}
+
+fn emit_policy_decision_success(operation: &str, rule_count: u64) {
+    openshell_core::telemetry::emit_policy_decision(operation, "success", rule_count);
+}
+
+fn emit_policy_decision_failure(operation: &str, rule_count: u64) {
+    openshell_core::telemetry::emit_policy_decision(operation, "failure", rule_count);
+}
+
 fn emit_gateway_policy_audit_log(
     sandbox_id: &str,
     sandbox_name: &str,
@@ -659,6 +695,21 @@ pub(super) async fn handle_update_config(
     request: Request<UpdateConfigRequest>,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     let sandbox_caller = is_sandbox_caller(&request);
+    let update = request.get_ref();
+    let should_emit_policy_failure = should_emit_config_update_policy_telemetry(sandbox_caller)
+        && (update.policy.is_some() || !update.merge_operations.is_empty());
+    let result = handle_update_config_inner(state, request).await;
+    if result.is_err() && should_emit_policy_failure {
+        emit_sandbox_policy_update_failure();
+    }
+    result
+}
+
+async fn handle_update_config_inner(
+    state: &Arc<ServerState>,
+    request: Request<UpdateConfigRequest>,
+) -> Result<Response<UpdateConfigResponse>, Status> {
+    let sandbox_caller = is_sandbox_caller(&request);
     let req = request.into_inner();
     if sandbox_caller {
         validate_sandbox_caller_update(&req)?;
@@ -981,6 +1032,7 @@ pub(super) async fn handle_update_config(
             operation_count = merge_ops.len(),
             "UpdateConfig: merged incremental policy operations"
         );
+        emit_config_update_policy_success(sandbox_caller);
 
         return Ok(Response::new(UpdateConfigResponse {
             version: u32::try_from(version).unwrap_or(0),
@@ -1080,6 +1132,7 @@ pub(super) async fn handle_update_config(
         policy_hash = %hash,
         "UpdateConfig: new policy version persisted"
     );
+    emit_full_policy_update_success(sandbox_caller, next_version);
 
     Ok(Response::new(UpdateConfigResponse {
         version: u32::try_from(next_version).unwrap_or(0),
@@ -1359,6 +1412,22 @@ pub(super) async fn handle_submit_policy_analysis(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    for summary in &req.network_activity_summaries {
+        state
+            .telemetry
+            .record_network_activity(&sandbox_id, summary);
+    }
+    if req.proposed_chunks.is_empty()
+        && req.summaries.is_empty()
+        && !req.network_activity_summaries.is_empty()
+    {
+        return Ok(Response::new(SubmitPolicyAnalysisResponse {
+            accepted_chunks: 0,
+            rejected_chunks: 0,
+            rejection_reasons: Vec::new(),
+            accepted_chunk_ids: Vec::new(),
+        }));
+    }
 
     let current_version = state
         .store
@@ -1532,6 +1601,17 @@ pub(super) async fn handle_approve_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<ApproveDraftChunkRequest>,
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
+    let result = handle_approve_draft_chunk_inner(state, request).await;
+    if result.is_err() {
+        emit_policy_decision_failure("approve", 1);
+    }
+    result
+}
+
+async fn handle_approve_draft_chunk_inner(
+    state: &Arc<ServerState>,
+    request: Request<ApproveDraftChunkRequest>,
+) -> Result<Response<ApproveDraftChunkResponse>, Status> {
     let req = request.into_inner();
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
@@ -1608,6 +1688,8 @@ pub(super) async fn handle_approve_draft_chunk(
         policy_hash = %hash,
         "ApproveDraftChunk: rule merged successfully"
     );
+    emit_sandbox_policy_update_success();
+    emit_policy_decision_success("approve", 1);
 
     Ok(Response::new(ApproveDraftChunkResponse {
         policy_version: u32::try_from(version).unwrap_or(0),
@@ -1616,6 +1698,17 @@ pub(super) async fn handle_approve_draft_chunk(
 }
 
 pub(super) async fn handle_reject_draft_chunk(
+    state: &Arc<ServerState>,
+    request: Request<RejectDraftChunkRequest>,
+) -> Result<Response<RejectDraftChunkResponse>, Status> {
+    let result = handle_reject_draft_chunk_inner(state, request).await;
+    if result.is_err() {
+        emit_policy_decision_failure("reject", 1);
+    }
+    result
+}
+
+async fn handle_reject_draft_chunk_inner(
     state: &Arc<ServerState>,
     request: Request<RejectDraftChunkRequest>,
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
@@ -1677,6 +1770,7 @@ pub(super) async fn handle_reject_draft_chunk(
             version,
             &hash,
         );
+        emit_sandbox_policy_update_success();
     }
 
     let now_ms = current_time_ms();
@@ -1695,11 +1789,23 @@ pub(super) async fn handle_reject_draft_chunk(
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
+    emit_policy_decision_success("reject", 1);
 
     Ok(Response::new(RejectDraftChunkResponse {}))
 }
 
 pub(super) async fn handle_approve_all_draft_chunks(
+    state: &Arc<ServerState>,
+    request: Request<ApproveAllDraftChunksRequest>,
+) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
+    let result = handle_approve_all_draft_chunks_inner(state, request).await;
+    if result.is_err() {
+        emit_policy_decision_failure("approve_all", 0);
+    }
+    result
+}
+
+async fn handle_approve_all_draft_chunks_inner(
     state: &Arc<ServerState>,
     request: Request<ApproveAllDraftChunksRequest>,
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
@@ -1784,6 +1890,7 @@ pub(super) async fn handle_approve_all_draft_chunks(
             &last_hash,
         );
         chunks_approved += 1;
+        emit_sandbox_policy_update_success();
     }
 
     state.sandbox_watch_bus.notify(&sandbox_id);
@@ -1806,6 +1913,7 @@ pub(super) async fn handle_approve_all_draft_chunks(
         policy_hash = %last_hash,
         "ApproveAllDraftChunks: bulk approval complete"
     );
+    emit_policy_decision_success("approve_all", u64::from(chunks_approved));
 
     Ok(Response::new(ApproveAllDraftChunksResponse {
         policy_version: u32::try_from(last_version).unwrap_or(0),
@@ -1869,6 +1977,17 @@ pub(super) async fn handle_edit_draft_chunk(
 }
 
 pub(super) async fn handle_undo_draft_chunk(
+    state: &Arc<ServerState>,
+    request: Request<UndoDraftChunkRequest>,
+) -> Result<Response<UndoDraftChunkResponse>, Status> {
+    let result = handle_undo_draft_chunk_inner(state, request).await;
+    if result.is_err() {
+        emit_policy_decision_failure("undo", 1);
+    }
+    result
+}
+
+async fn handle_undo_draft_chunk_inner(
     state: &Arc<ServerState>,
     request: Request<UndoDraftChunkRequest>,
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
@@ -1944,6 +2063,8 @@ pub(super) async fn handle_undo_draft_chunk(
         policy_hash = %hash,
         "UndoDraftChunk: rule removed, chunk reverted to pending"
     );
+    emit_sandbox_policy_update_success();
+    emit_policy_decision_success("undo", 1);
 
     Ok(Response::new(UndoDraftChunkResponse {
         policy_version: u32::try_from(version).unwrap_or(0),
@@ -2874,6 +2995,19 @@ mod tests {
             oidc::AUTH_SOURCE_SANDBOX.parse().unwrap(),
         );
         assert!(is_sandbox_caller(&req));
+    }
+
+    #[test]
+    fn sandbox_caller_policy_sync_does_not_emit_policy_update_telemetry() {
+        assert!(!should_emit_config_update_policy_telemetry(true));
+        assert!(should_emit_config_update_policy_telemetry(false));
+    }
+
+    #[test]
+    fn first_policy_revision_does_not_emit_policy_update_telemetry() {
+        assert!(!should_emit_full_policy_update_telemetry(false, 1));
+        assert!(!should_emit_full_policy_update_telemetry(true, 2));
+        assert!(should_emit_full_policy_update_telemetry(false, 2));
     }
 
     // ---- Sandbox without policy ----
