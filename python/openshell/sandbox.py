@@ -35,10 +35,24 @@ class TlsConfig:
 
 
 @dataclass(frozen=True)
+class SandboxStatusRef:
+    phase: int
+    current_policy_version: int
+
+
+@dataclass(frozen=True)
 class SandboxRef:
     id: str
     name: str
-    phase: int
+    status: SandboxStatusRef
+
+    @property
+    def phase(self) -> int:
+        return self.status.phase
+
+    @property
+    def current_policy_version(self) -> int:
+        return self.status.current_policy_version
 
 
 @dataclass(frozen=True)
@@ -261,9 +275,9 @@ class SandboxClient:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             sandbox = self.get(sandbox_name)
-            if sandbox.phase == openshell_pb2.SANDBOX_PHASE_READY:
+            if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_READY:
                 return sandbox
-            if sandbox.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
+            if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
                 raise SandboxError(f"sandbox {sandbox_name} entered error phase")
             time.sleep(1)
         raise SandboxError(f"sandbox {sandbox_name} was not ready within timeout")
@@ -585,10 +599,14 @@ def _serialize_python_callable(
 
 
 def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
+    status = sandbox.status if sandbox.HasField("status") else None
     return SandboxRef(
         id=sandbox.metadata.id if sandbox.metadata else "",
         name=sandbox.metadata.name if sandbox.metadata else "",
-        phase=sandbox.phase,
+        status=SandboxStatusRef(
+            phase=status.phase if status else 0,
+            current_policy_version=status.current_policy_version if status else 0,
+        ),
     )
 
 
