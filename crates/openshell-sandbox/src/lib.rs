@@ -174,6 +174,8 @@ use crate::l7::tls::{
 };
 use crate::opa::OpaEngine;
 use crate::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
+#[cfg(target_os = "linux")]
+use crate::proxy::LoopbackProxyHandle;
 use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
@@ -571,8 +573,10 @@ pub async fn run_sandbox(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
-    let (_proxy, denial_rx, bypass_denial_tx) = if matches!(policy.network.mode, NetworkMode::Proxy)
-    {
+    let (_proxy, loopback_proxy, denial_rx, bypass_denial_tx) = if matches!(
+        policy.network.mode,
+        NetworkMode::Proxy
+    ) {
         let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
             miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
         })?;
@@ -617,20 +621,65 @@ pub async fn run_sandbox(
         let proxy_handle = ProxyHandle::start_with_bind_addr(
             proxy_policy,
             bind_addr,
-            engine,
-            cache,
+            engine.clone(),
+            cache.clone(),
             entrypoint_pid.clone(),
-            tls_state,
-            inference_ctx,
+            tls_state.clone(),
+            inference_ctx.clone(),
             Some(provider_credentials.clone()),
             Some(policy_local_ctx.clone()),
-            denial_tx,
+            denial_tx.clone(),
         )
         .await?;
-        (Some(proxy_handle), denial_rx, bypass_denial_tx)
+
+        #[cfg(target_os = "linux")]
+        let loopback_proxy_handle = if let (Some(ns), Some(_upstream_addr)) =
+            (netns.as_ref(), bind_addr)
+        {
+            let Some(netns_fd) = ns.ns_fd() else {
+                return Err(miette::miette!(
+                    "Managed loopback proxy requires a sandbox network namespace file descriptor"
+                ));
+            };
+            let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
+            let listen_addr: SocketAddr = ([127, 0, 0, 1], port).into();
+            Some(LoopbackProxyHandle::start_in_netns(
+                netns_fd,
+                listen_addr,
+                engine,
+                cache,
+                entrypoint_pid.clone(),
+                tls_state,
+                inference_ctx,
+                Some(provider_credentials.clone()),
+                Some(policy_local_ctx.clone()),
+                denial_tx,
+            )?)
+        } else {
+            None
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let loopback_proxy_handle: Option<()> = None;
+
+        (
+            Some(proxy_handle),
+            loopback_proxy_handle,
+            denial_rx,
+            bypass_denial_tx,
+        )
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
+
+    #[cfg(target_os = "linux")]
+    let loopback_proxy_url = loopback_proxy.as_ref().map(LoopbackProxyHandle::proxy_url);
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = &loopback_proxy;
+
+    #[cfg(not(target_os = "linux"))]
+    let loopback_proxy_url: Option<String> = None;
 
     // Spawn bypass detection monitor (Linux only, proxy mode only).
     // Reads /dev/kmsg for nftables log entries and emits structured
@@ -758,6 +807,7 @@ pub async fn run_sandbox(
         let policy_clone = policy.clone();
         let workdir_clone = workdir.clone();
         let proxy_url = ssh_proxy_url;
+        let loopback_proxy_url = loopback_proxy_url.clone();
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
         let provider_credentials_clone = provider_credentials.clone();
@@ -772,6 +822,7 @@ pub async fn run_sandbox(
                 workdir_clone,
                 netns_fd,
                 proxy_url,
+                loopback_proxy_url,
                 ca_paths,
                 provider_credentials_clone,
             )
@@ -838,6 +889,7 @@ pub async fn run_sandbox(
         interactive,
         &policy,
         netns.as_ref(),
+        loopback_proxy_url.as_deref(),
         ca_file_paths.as_ref(),
         &provider_env,
     )?;
@@ -849,6 +901,7 @@ pub async fn run_sandbox(
         workdir.as_deref(),
         interactive,
         &policy,
+        loopback_proxy_url.as_deref(),
         ca_file_paths.as_ref(),
         &provider_env,
     )?;

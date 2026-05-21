@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 expected_no_proxy = '127.0.0.1,localhost,::1'
 assert os.environ['HTTP_PROXY'].startswith('http://')
 assert os.environ['HTTPS_PROXY'].startswith('http://')
+assert os.environ['OPENSHELL_LOOPBACK_PROXY_URL'].startswith('http://127.0.0.1:')
 assert os.environ['NO_PROXY'] == expected_no_proxy
 assert os.environ['no_proxy'] == expected_no_proxy
 
@@ -37,6 +38,7 @@ try:
     with urllib.request.urlopen(f'http://127.0.0.1:{server.server_port}', timeout=10) as response:
         print(json.dumps({
             'no_proxy': os.environ['NO_PROXY'],
+            'loopback_proxy': os.environ['OPENSHELL_LOOPBACK_PROXY_URL'].split(':')[:2],
             'payload': json.loads(response.read().decode()),
         }), flush=True)
 finally:
@@ -53,9 +55,11 @@ async fn sandbox_bypasses_proxy_for_localhost_http() {
         .expect("sandbox create with localhost proxy bypass check");
 
     assert!(
-        guard.create_output.contains(
-            r#"{"no_proxy": "127.0.0.1,localhost,::1", "payload": {"message": "hello"}}"#
-        ),
+        guard
+            .create_output
+            .contains(r#""no_proxy": "127.0.0.1,localhost,::1""#)
+            && guard.create_output.contains(r#""loopback_proxy": ["http", "//127.0.0.1"]"#)
+            && guard.create_output.contains(r#""payload": {"message": "hello"}"#),
         "expected localhost HTTP request to bypass proxy and succeed:\n{}",
         guard.create_output
     );

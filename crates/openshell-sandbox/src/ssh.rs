@@ -105,6 +105,7 @@ pub async fn run_ssh_server(
     workdir: Option<String>,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
+    loopback_proxy_url: Option<String>,
     ca_file_paths: Option<(PathBuf, PathBuf)>,
     provider_credentials: ProviderCredentialState,
 ) -> Result<()> {
@@ -129,6 +130,7 @@ pub async fn run_ssh_server(
         let policy = policy.clone();
         let workdir = workdir.clone();
         let proxy_url = proxy_url.clone();
+        let loopback_proxy_url = loopback_proxy_url.clone();
         let ca_paths = ca_paths.clone();
         let provider_credentials = provider_credentials.clone();
 
@@ -140,6 +142,7 @@ pub async fn run_ssh_server(
                 workdir,
                 netns_fd,
                 proxy_url,
+                loopback_proxy_url,
                 ca_paths,
                 provider_credentials,
             )
@@ -166,6 +169,7 @@ async fn handle_connection(
     workdir: Option<String>,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
+    loopback_proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_credentials: ProviderCredentialState,
 ) -> Result<()> {
@@ -188,6 +192,7 @@ async fn handle_connection(
         workdir,
         netns_fd,
         proxy_url,
+        loopback_proxy_url,
         ca_file_paths,
         provider_credentials,
     );
@@ -215,6 +220,7 @@ struct SshHandler {
     workdir: Option<String>,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
+    loopback_proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_credentials: ProviderCredentialState,
     channels: HashMap<ChannelId, ChannelState>,
@@ -226,6 +232,7 @@ impl SshHandler {
         workdir: Option<String>,
         netns_fd: Option<RawFd>,
         proxy_url: Option<String>,
+        loopback_proxy_url: Option<String>,
         ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
         provider_credentials: ProviderCredentialState,
     ) -> Self {
@@ -234,6 +241,7 @@ impl SshHandler {
             workdir,
             netns_fd,
             proxy_url,
+            loopback_proxy_url,
             ca_file_paths,
             provider_credentials,
             channels: HashMap::new(),
@@ -456,6 +464,7 @@ impl russh::server::Handler for SshHandler {
                 channel,
                 self.netns_fd,
                 self.proxy_url.clone(),
+                self.loopback_proxy_url.clone(),
                 self.ca_file_paths.clone(),
                 &self.provider_credentials.snapshot().child_env,
             )?;
@@ -551,6 +560,7 @@ impl SshHandler {
                 channel,
                 self.netns_fd,
                 self.proxy_url.clone(),
+                self.loopback_proxy_url.clone(),
                 self.ca_file_paths.clone(),
                 &provider_snapshot.child_env,
             )?;
@@ -568,6 +578,7 @@ impl SshHandler {
                 channel,
                 self.netns_fd,
                 self.proxy_url.clone(),
+                self.loopback_proxy_url.clone(),
                 self.ca_file_paths.clone(),
                 &provider_snapshot.child_env,
             )?;
@@ -674,6 +685,7 @@ fn apply_child_env(
     session_user: &str,
     term: &str,
     proxy_url: Option<&str>,
+    loopback_proxy_url: Option<&str>,
     ca_file_paths: Option<&(PathBuf, PathBuf)>,
     provider_env: &HashMap<String, String>,
 ) {
@@ -689,6 +701,12 @@ fn apply_child_env(
 
     if let Some(url) = proxy_url {
         for (key, value) in child_env::proxy_env_vars(url) {
+            cmd.env(key, value);
+        }
+    }
+
+    if let Some(url) = loopback_proxy_url {
+        for (key, value) in child_env::loopback_proxy_env_vars(url) {
             cmd.env(key, value);
         }
     }
@@ -714,6 +732,7 @@ fn spawn_pty_shell(
     channel: ChannelId,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
+    loopback_proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: &HashMap<String, String>,
 ) -> anyhow::Result<(std::fs::File, mpsc::Sender<Vec<u8>>)> {
@@ -762,6 +781,7 @@ fn spawn_pty_shell(
         &session_user,
         term,
         proxy_url.as_deref(),
+        loopback_proxy_url.as_deref(),
         ca_file_paths.as_deref(),
         provider_env,
     );
@@ -877,6 +897,7 @@ fn spawn_pipe_exec(
     channel: ChannelId,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
+    loopback_proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: &HashMap<String, String>,
 ) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
@@ -907,6 +928,7 @@ fn spawn_pipe_exec(
         &session_user,
         "dumb",
         proxy_url.as_deref(),
+        loopback_proxy_url.as_deref(),
         ca_file_paths.as_deref(),
         provider_env,
     );

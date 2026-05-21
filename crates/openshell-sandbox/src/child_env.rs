@@ -21,6 +21,13 @@ pub fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
     ]
 }
 
+pub fn loopback_proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 1] {
+    [(
+        openshell_core::sandbox_env::LOOPBACK_PROXY_URL,
+        proxy_url.to_owned(),
+    )]
+}
+
 pub fn tls_env_vars(
     ca_cert_path: &Path,
     combined_bundle_path: &Path,
@@ -63,6 +70,27 @@ mod tests {
         assert!(stdout.contains("NO_PROXY=127.0.0.1,localhost,::1"));
         assert!(stdout.contains("NODE_USE_ENV_PROXY=1"));
         assert!(stdout.contains("no_proxy=127.0.0.1,localhost,::1"));
+    }
+
+    #[test]
+    fn apply_loopback_proxy_env_exposes_managed_url_without_changing_proxy_vars() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        for (key, value) in proxy_env_vars("http://10.200.0.1:3128") {
+            cmd.env(key, value);
+        }
+        for (key, value) in loopback_proxy_env_vars("http://127.0.0.1:3128") {
+            cmd.env(key, value);
+        }
+
+        let output = cmd.output().expect("spawn env");
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+
+        assert!(stdout.contains("HTTP_PROXY=http://10.200.0.1:3128"));
+        assert!(stdout.contains("OPENSHELL_LOOPBACK_PROXY_URL=http://127.0.0.1:3128"));
     }
 
     #[test]

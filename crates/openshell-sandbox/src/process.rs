@@ -94,6 +94,7 @@ impl ProcessHandle {
         interactive: bool,
         policy: &SandboxPolicy,
         netns: Option<&NetworkNamespace>,
+        loopback_proxy_url: Option<&str>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
@@ -104,6 +105,7 @@ impl ProcessHandle {
             interactive,
             policy,
             netns.and_then(NetworkNamespace::ns_fd),
+            loopback_proxy_url,
             ca_paths,
             provider_env,
         )
@@ -121,6 +123,7 @@ impl ProcessHandle {
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        loopback_proxy_url: Option<&str>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
@@ -130,6 +133,7 @@ impl ProcessHandle {
             workdir,
             interactive,
             policy,
+            loopback_proxy_url,
             ca_paths,
             provider_env,
         )
@@ -144,6 +148,7 @@ impl ProcessHandle {
         interactive: bool,
         policy: &SandboxPolicy,
         netns_fd: Option<RawFd>,
+        loopback_proxy_url: Option<&str>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
@@ -182,6 +187,12 @@ impl ProcessHandle {
                 for (key, value) in child_env::proxy_env_vars(&proxy_url) {
                     cmd.env(key, value);
                 }
+            }
+        }
+
+        if let Some(url) = loopback_proxy_url {
+            for (key, value) in child_env::loopback_proxy_env_vars(url) {
+                cmd.env(key, value);
             }
         }
 
@@ -270,6 +281,7 @@ impl ProcessHandle {
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        loopback_proxy_url: Option<&str>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
@@ -298,6 +310,12 @@ impl ProcessHandle {
                 for (key, value) in child_env::proxy_env_vars(&proxy_url) {
                     cmd.env(key, value);
                 }
+            }
+        }
+
+        if let Some(url) = loopback_proxy_url {
+            for (key, value) in child_env::loopback_proxy_env_vars(url) {
+                cmd.env(key, value);
             }
         }
 

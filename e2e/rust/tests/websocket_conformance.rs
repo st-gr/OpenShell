@@ -364,13 +364,14 @@ def read_frame(sock):
     return first, payload
 
 def proxy_parts():
-    names = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
-    proxy_url = next((os.environ.get(name) for name in names if os.environ.get(name)), None)
+    proxy_url = os.environ.get("OPENSHELL_LOOPBACK_PROXY_URL")
     if not proxy_url:
-        raise RuntimeError("proxy environment is not configured")
+        raise RuntimeError("managed loopback proxy URL is not configured")
     parsed = urllib.parse.urlparse(proxy_url)
     if not parsed.hostname:
         raise RuntimeError(f"invalid proxy URL: {{proxy_url!r}}")
+    if parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise RuntimeError(f"managed loopback proxy URL is not loopback: {{proxy_url!r}}")
     return parsed.hostname, parsed.port or 80
 
 def connect_with_retry(host, port, timeout_seconds=20):
