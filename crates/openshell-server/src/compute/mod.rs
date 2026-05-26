@@ -924,7 +924,12 @@ impl ComputeRuntime {
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(&incoming.id, 0, |sandbox| {
-                let mut phase = derive_phase(incoming.status.as_ref());
+                let old_phase =
+                    SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+                let mut phase = incoming
+                    .status
+                    .as_ref()
+                    .map_or(old_phase, |status| derive_phase(Some(status)));
                 let supervisor_promoted = session_connected
                     && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown);
                 if supervisor_promoted {
@@ -935,14 +940,19 @@ impl ComputeRuntime {
                 let mut status = incoming
                     .status
                     .as_ref()
-                    .map(|s| public_status_from_driver(s, phase, cpv));
+                    .map(|s| public_status_from_driver(s, phase, cpv))
+                    .or_else(|| sandbox.status.clone());
                 rewrite_user_facing_conditions(&mut status, sandbox.spec.as_ref());
                 if supervisor_promoted {
                     ensure_supervisor_ready_status(&mut status, &sandbox_name);
                 }
 
-                let old_phase =
-                    SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+                if let Some(s) = status.as_mut()
+                    && s.sandbox_name.is_empty()
+                {
+                    s.sandbox_name.clone_from(&sandbox_name);
+                }
+
                 if old_phase != phase {
                     info!(
                         sandbox_id = %incoming.id,
@@ -978,6 +988,7 @@ impl ComputeRuntime {
                 }
                 sandbox.status = status;
                 sandbox.set_phase(phase as i32);
+                sandbox.set_current_policy_version(cpv);
             })
             .await
             .map_err(|e| match e {
@@ -2326,6 +2337,62 @@ mod tests {
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
         );
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_without_status_preserves_existing_status() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.status = Some(SandboxStatus {
+            sandbox_name: "sandbox-a".to_string(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: "DependenciesReady".to_string(),
+                message: "Pod is Ready".to_string(),
+                last_transition_time: String::new(),
+            }],
+            current_policy_version: 7,
+            ..Default::default()
+        });
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: None,
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        assert_eq!(stored.current_policy_version(), 7);
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.r#type == "Ready")
+            })
+            .unwrap();
+        assert_eq!(ready.status, "True");
+        assert_eq!(ready.reason, "DependenciesReady");
+        assert_eq!(ready.message, "Pod is Ready");
     }
 
     #[tokio::test]
