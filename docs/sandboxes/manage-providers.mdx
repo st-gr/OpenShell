@@ -246,10 +246,6 @@ The following provider types are supported.
 |---|---|---|
 | `anthropic` | `ANTHROPIC_API_KEY` | Anthropic API |
 | `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | Claude Code, Anthropic API |
-
-<Note>
-`ANTHROPIC_API_KEY` is an API key from [console.anthropic.com](https://console.anthropic.com), not a Claude.ai subscription token. Claude Max and Pro subscription users must generate a separate API key from the Anthropic Console.
-</Note>
 | `codex` | `OPENAI_API_KEY` | OpenAI Codex |
 | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` | GitHub Copilot CLI |
 | `generic` | User-defined | Any service with custom credentials |
@@ -258,6 +254,10 @@ The following provider types are supported.
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
 | `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint. Set `--config OPENAI_BASE_URL` to point to the provider. Refer to [Inference Routing](/sandboxes/inference-routing). |
 | `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | OpenCode |
+
+<Note>
+`ANTHROPIC_API_KEY` is an API key from [console.anthropic.com](https://console.anthropic.com), not a subscription token. Subscription users must generate a separate API key from the Anthropic Console.
+</Note>
 
 <Tip>
 Use the `generic` type for any service not listed above. You define the
