@@ -72,6 +72,47 @@ jobs:
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           openshell status
 
+  ubuntu-snap:
+    name: Ubuntu Snap
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install snapd
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y snapd
+          sudo systemctl start snapd
+
+      - name: Install Docker snap
+        run: |
+          sudo snap install docker
+
+      - name: Download snap from release
+        run: |
+          set -euo pipefail
+          SNAP_NAME=$(curl -sL "https://api.github.com/repos/NVIDIA/OpenShell/releases/tags/dev" | jq -r '.assets[].name' | grep -E 'openshell_.*amd64\.snap$' | head -1)
+          if [ -z "$SNAP_NAME" ]; then
+            echo "Could not find snap asset in dev release"
+            exit 1
+          fi
+          curl -LsSf "https://github.com/NVIDIA/OpenShell/releases/download/dev/$SNAP_NAME" -o openshell.snap
+
+      - name: Install snap (dangerous — from release, not store)
+        run: |
+          sudo snap install ./openshell.snap --dangerous
+
+      - name: Connect interfaces
+        run: |
+          sudo snap connect openshell:docker docker:docker-daemon
+          sudo snap connect openshell:log-observe
+          sudo snap connect openshell:system-observe
+          sudo snap connect openshell:ssh-keys
+
+      - name: Check status
+        run: |
+          openshell status
+
   kubernetes:
     name: Kubernetes Helm (kind)
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
