@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::inference_client::InferenceClient;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use rustls::{
@@ -99,7 +100,7 @@ impl TlsOptions {
         }
     }
 
-    /// Returns `true` when using bearer token auth (edge or OIDC).
+    /// Returns `true` when using bearer token auth.
     pub fn is_bearer_auth(&self) -> bool {
         self.edge_token.is_some() || self.oidc_token.is_some()
     }
@@ -396,9 +397,9 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         .keep_alive_while_idle(true);
 
     let tls_config = if tls.oidc_token.is_some() {
-        // OIDC bearer auth over HTTPS: use mTLS certs for the transport layer
-        // when available (server may still require client certs), and layer
-        // the Bearer token on top via the interceptor.
+        // Bearer auth over HTTPS: use mTLS certs for the transport layer when
+        // available (server may still require client certs), and layer the
+        // Bearer token on top via the interceptor.
         require_tls_materials(server, tls).map_or_else(
             |_| {
                 let resolved = tls.with_default_paths(server);
@@ -435,85 +436,16 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
 /// Otherwise, standard mTLS is used (interceptor is a no-op).
 pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
     let channel = build_channel(server, tls).await?;
-    let interceptor = EdgeAuthInterceptor::maybe_from(tls)?;
+    let interceptor = interceptor_from_tls(tls)?;
     Ok(OpenShellClient::with_interceptor(channel, interceptor))
 }
 
-/// Interceptor that injects authentication headers into every outgoing gRPC request.
-///
-/// Supports OIDC Bearer tokens (standard `authorization` header) and
-/// Cloudflare Access tokens (custom headers). When no token is set, acts
-/// as a no-op. OIDC takes precedence over edge tokens.
-#[derive(Clone)]
-#[allow(clippy::struct_field_names)]
-pub struct EdgeAuthInterceptor {
-    /// Standard `authorization: Bearer <token>` for OIDC.
-    bearer_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
-    /// CF-specific `Cf-Access-Jwt-Assertion` header.
-    header_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
-    /// CF-specific `Cookie: CF_Authorization=<token>` header.
-    cookie_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
-}
-
-impl EdgeAuthInterceptor {
-    /// Create an interceptor from [`TlsOptions`].  Returns a no-op interceptor
-    /// when no auth token is configured.
-    pub fn maybe_from(tls: &TlsOptions) -> Result<Self> {
-        // OIDC bearer token takes precedence.
-        if let Some(ref token) = tls.oidc_token {
-            let bearer: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
-                format!("Bearer {token}")
-                    .parse()
-                    .map_err(|_| miette::miette!("invalid OIDC token value"))?;
-            return Ok(Self {
-                bearer_value: Some(bearer),
-                header_value: None,
-                cookie_value: None,
-            });
-        }
-
-        let (header_value, cookie_value) = match tls.edge_token.as_deref() {
-            Some(t) => {
-                let hv: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = t
-                    .parse()
-                    .map_err(|_| miette::miette!("invalid edge token value"))?;
-                let cv: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
-                    format!("CF_Authorization={t}")
-                        .parse()
-                        .map_err(|_| miette::miette!("invalid edge token value for cookie"))?;
-                (Some(hv), Some(cv))
-            }
-            None => (None, None),
-        };
-        Ok(Self {
-            bearer_value: None,
-            header_value,
-            cookie_value,
-        })
-    }
-}
-
-impl tonic::service::Interceptor for EdgeAuthInterceptor {
-    fn call(
-        &mut self,
-        mut req: tonic::Request<()>,
-    ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
-        if let Some(ref val) = self.bearer_value {
-            req.metadata_mut().insert("authorization", val.clone());
-        }
-        if let Some(ref val) = self.header_value {
-            req.metadata_mut()
-                .insert("cf-access-jwt-assertion", val.clone());
-        }
-        if let Some(ref val) = self.cookie_value {
-            req.metadata_mut().insert("cookie", val.clone());
-        }
-        Ok(req)
-    }
+fn interceptor_from_tls(tls: &TlsOptions) -> Result<EdgeAuthInterceptor> {
+    EdgeAuthInterceptor::new(tls.oidc_token.as_deref(), tls.edge_token.as_deref())
 }
 
 pub async fn grpc_inference_client(server: &str, tls: &TlsOptions) -> Result<GrpcInferenceClient> {
     let channel = build_channel(server, tls).await?;
-    let interceptor = EdgeAuthInterceptor::maybe_from(tls)?;
+    let interceptor = interceptor_from_tls(tls)?;
     Ok(InferenceClient::with_interceptor(channel, interceptor))
 }

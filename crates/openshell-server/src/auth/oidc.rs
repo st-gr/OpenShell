@@ -10,7 +10,10 @@
 //! This module owns authentication (verifying who the caller is).
 //! Authorization (deciding what the caller can do) is in `authz.rs`.
 
+use super::authenticator::Authenticator;
 use super::identity::{Identity, IdentityProvider};
+use super::principal::{Principal, UserPrincipal};
+use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use openshell_core::OidcConfig;
 use reqwest::Client;
@@ -22,14 +25,6 @@ use tokio::sync::RwLock;
 use tonic::Status;
 use tracing::{debug, info, warn};
 
-/// Internal metadata header set by the auth middleware after it validates
-/// a sandbox-secret-authenticated request. This is stripped from all incoming
-/// requests first so external callers cannot spoof it.
-pub const INTERNAL_AUTH_SOURCE_HEADER: &str = "x-openshell-auth-source";
-/// Internal auth-source marker for requests authenticated via the shared
-/// sandbox secret.
-pub const AUTH_SOURCE_SANDBOX_SECRET: &str = "sandbox-secret";
-
 /// Truly unauthenticated methods — health probes and infrastructure.
 const UNAUTHENTICATED_METHODS: &[&str] = &[
     "/openshell.v1.OpenShell/Health",
@@ -39,85 +34,12 @@ const UNAUTHENTICATED_METHODS: &[&str] = &[
 /// Path prefixes that bypass OIDC validation (gRPC reflection, health probes).
 const UNAUTHENTICATED_PREFIXES: &[&str] = &["/grpc.reflection.", "/grpc.health."];
 
-/// Sandbox-to-server RPCs that use the shared sandbox secret instead of
-/// OIDC Bearer tokens. These require the `x-sandbox-secret` metadata header
-/// matching the server's SSH handshake secret.
-const SANDBOX_SECRET_METHODS: &[&str] = &[
-    "/openshell.v1.OpenShell/ReportPolicyStatus",
-    "/openshell.v1.OpenShell/PushSandboxLogs",
-    "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
-    "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
-    "/openshell.sandbox.v1.SandboxService/GetSandboxConfig",
-    "/openshell.inference.v1.Inference/GetInferenceBundle",
-];
-
-/// Methods that accept either OIDC Bearer token (CLI users) or sandbox
-/// secret (supervisor). `UpdateConfig` is called by both CLI
-/// (policy/settings mutations) and the sandbox supervisor (policy sync on
-/// startup). `OpenShell/GetSandboxConfig` serves CLI settings reads while
-/// remaining compatible with sandbox-secret-authenticated callers.
-const DUAL_AUTH_METHODS: &[&str] = &[
-    "/openshell.v1.OpenShell/UpdateConfig",
-    "/openshell.v1.OpenShell/GetSandboxConfig",
-];
-
-/// Returns `true` if the method accepts either Bearer or sandbox-secret auth.
-pub fn is_dual_auth_method(path: &str) -> bool {
-    DUAL_AUTH_METHODS.contains(&path)
-}
-
 /// Returns `true` if the method needs no authentication at all.
 pub fn is_unauthenticated_method(path: &str) -> bool {
     UNAUTHENTICATED_METHODS.contains(&path)
         || UNAUTHENTICATED_PREFIXES
             .iter()
             .any(|prefix| path.starts_with(prefix))
-}
-
-/// Returns `true` if the method authenticates via the sandbox shared secret
-/// rather than an OIDC Bearer token.
-pub fn is_sandbox_secret_method(path: &str) -> bool {
-    SANDBOX_SECRET_METHODS.contains(&path)
-}
-
-/// Validate the `x-sandbox-secret` header against the server's handshake secret.
-#[allow(clippy::result_large_err)]
-pub fn validate_sandbox_secret(
-    headers: &http::HeaderMap,
-    expected_secret: &str,
-) -> Result<(), Status> {
-    let provided = headers
-        .get("x-sandbox-secret")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Status::unauthenticated("sandbox secret required for this method"))?;
-
-    if provided != expected_secret {
-        return Err(Status::unauthenticated("invalid sandbox secret"));
-    }
-
-    Ok(())
-}
-
-/// Remove internal auth-source markers from the request before any auth
-/// decision is made so external callers cannot spoof them.
-pub fn clear_internal_auth_markers(headers: &mut http::HeaderMap) {
-    headers.remove(INTERNAL_AUTH_SOURCE_HEADER);
-}
-
-/// Mark the request as authenticated via the shared sandbox secret.
-pub fn mark_sandbox_secret_authenticated(headers: &mut http::HeaderMap) {
-    headers.insert(
-        INTERNAL_AUTH_SOURCE_HEADER,
-        http::HeaderValue::from_static(AUTH_SOURCE_SANDBOX_SECRET),
-    );
-}
-
-/// Returns `true` if the request metadata indicates sandbox-secret auth.
-pub fn is_sandbox_secret_authenticated(metadata: &tonic::metadata::MetadataMap) -> bool {
-    metadata
-        .get(INTERNAL_AUTH_SOURCE_HEADER)
-        .and_then(|v| v.to_str().ok())
-        == Some(AUTH_SOURCE_SANDBOX_SECRET)
 }
 
 /// Cached JWKS key set fetched from the OIDC issuer.
@@ -429,6 +351,42 @@ impl JwksCache {
     }
 }
 
+/// Authenticator that validates `Authorization: Bearer <jwt>` headers against
+/// the configured OIDC issuer.
+///
+/// Returns `Ok(None)` when no Bearer header is present, so the chain can fall
+/// through to other authenticators (e.g. the gateway-minted sandbox JWT
+/// authenticator).
+pub struct OidcAuthenticator {
+    cache: Arc<JwksCache>,
+}
+
+impl OidcAuthenticator {
+    pub fn new(cache: Arc<JwksCache>) -> Self {
+        Self { cache }
+    }
+}
+
+#[async_trait]
+impl Authenticator for OidcAuthenticator {
+    async fn authenticate(
+        &self,
+        headers: &http::HeaderMap,
+        _path: &str,
+    ) -> Result<Option<Principal>, Status> {
+        let Some(token) = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+        else {
+            return Ok(None);
+        };
+
+        let identity = self.cache.validate_token(token).await?;
+        Ok(Some(Principal::User(UserPrincipal { identity })))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,9 +399,6 @@ mod tests {
     #[test]
     fn sandbox_operations_require_auth() {
         assert!(!is_unauthenticated_method(
-            "/openshell.v1.OpenShell/CreateSandbox"
-        ));
-        assert!(!is_sandbox_secret_method(
             "/openshell.v1.OpenShell/CreateSandbox"
         ));
     }
@@ -461,52 +416,6 @@ mod tests {
     #[test]
     fn grpc_health_is_unauthenticated() {
         assert!(is_unauthenticated_method("/grpc.health.v1.Health/Check"));
-    }
-
-    #[test]
-    fn sandbox_rpcs_use_sandbox_secret() {
-        assert!(is_sandbox_secret_method(
-            "/openshell.sandbox.v1.SandboxService/GetSandboxConfig"
-        ));
-        assert!(is_sandbox_secret_method(
-            "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
-        ));
-        assert!(is_sandbox_secret_method(
-            "/openshell.v1.OpenShell/ReportPolicyStatus"
-        ));
-        assert!(is_sandbox_secret_method(
-            "/openshell.v1.OpenShell/PushSandboxLogs"
-        ));
-        assert!(is_sandbox_secret_method(
-            "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
-        ));
-        assert!(is_sandbox_secret_method(
-            "/openshell.inference.v1.Inference/GetInferenceBundle"
-        ));
-    }
-
-    #[test]
-    fn openshell_get_sandbox_config_is_dual_auth() {
-        assert!(!is_sandbox_secret_method(
-            "/openshell.v1.OpenShell/GetSandboxConfig"
-        ));
-        assert!(is_dual_auth_method(
-            "/openshell.v1.OpenShell/GetSandboxConfig"
-        ));
-    }
-
-    #[test]
-    fn sandbox_secret_validation() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-sandbox-secret", "test-secret".parse().unwrap());
-        assert!(validate_sandbox_secret(&headers, "test-secret").is_ok());
-        assert!(validate_sandbox_secret(&headers, "wrong-secret").is_err());
-    }
-
-    #[test]
-    fn sandbox_secret_missing_header() {
-        let headers = http::HeaderMap::new();
-        assert!(validate_sandbox_secret(&headers, "test-secret").is_err());
     }
 
     #[test]

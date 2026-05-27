@@ -22,58 +22,43 @@ use std::process::Stdio;
 use tokio::process::{Child, Command};
 use tracing::debug;
 
-const SSH_HANDSHAKE_SECRET_ENV: &str = "OPENSHELL_SSH_HANDSHAKE_SECRET";
-
 fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>) {
     for (key, value) in provider_env {
         cmd.env(key, value);
     }
 }
 
-fn scrub_sensitive_env(cmd: &mut Command) {
-    cmd.env_remove(SSH_HANDSHAKE_SECRET_ENV);
-}
-
 #[cfg(unix)]
-#[allow(unsafe_code, clippy::borrow_as_ptr)]
 pub fn harden_child_process() -> Result<()> {
-    let core_limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    let rc = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const core_limit) };
-    if rc != 0 {
-        return Err(miette::miette!(
-            "Failed to disable core dumps: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    use rustix::process::{Resource, Rlimit, setrlimit};
+
+    setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        },
+    )
+    .map_err(|e| miette::miette!("Failed to disable core dumps: {e}"))?;
 
     // Limit process creation to prevent fork bombs. 512 processes per UID is
     // sufficient for typical agent workloads (shell, compilers, language servers)
     // while preventing runaway forking. Set as a hard limit so the sandbox user
     // cannot raise it after privilege drop.
-    let nproc_limit = libc::rlimit {
-        rlim_cur: 512,
-        rlim_max: 512,
-    };
-    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &raw const nproc_limit) };
-    if rc != 0 {
-        return Err(miette::miette!(
-            "Failed to set RLIMIT_NPROC: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    setrlimit(
+        Resource::Nproc,
+        Rlimit {
+            current: Some(512),
+            maximum: Some(512),
+        },
+    )
+    .map_err(|e| miette::miette!("Failed to set RLIMIT_NPROC: {e}"))?;
 
     #[cfg(target_os = "linux")]
     {
-        let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
-        if rc != 0 {
-            return Err(miette::miette!(
-                "Failed to set PR_SET_DUMPABLE=0: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+        use rustix::process::{DumpableBehavior, set_dumpable_behavior};
+        set_dumpable_behavior(DumpableBehavior::NotDumpable)
+            .map_err(|e| miette::miette!("Failed to set PR_SET_DUMPABLE=0: {e}"))?;
     }
 
     Ok(())
@@ -159,9 +144,17 @@ impl ProcessHandle {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
-            .env("OPENSHELL_SANDBOX", "1");
+            .env(openshell_core::sandbox_env::SANDBOX, "1");
 
-        scrub_sensitive_env(&mut cmd);
+        // Strip supervisor-only credentials from the entrypoint's inherited
+        // environment. The entrypoint drops to the sandbox user before
+        // `exec`; without this strip, anything running as the sandbox user
+        // (e.g. an SSH-spawned shell) could read /proc/<entrypoint_pid>/environ
+        // and recover the gateway-minted JWT. Issue #1354.
+        cmd.env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN)
+            .env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
+            .env_remove(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE);
+
         inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workdir {
@@ -286,9 +279,17 @@ impl ProcessHandle {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
-            .env("OPENSHELL_SANDBOX", "1");
+            .env(openshell_core::sandbox_env::SANDBOX, "1");
 
-        scrub_sensitive_env(&mut cmd);
+        // Strip supervisor-only credentials from the entrypoint's inherited
+        // environment. The entrypoint drops to the sandbox user before
+        // `exec`; without this strip, anything running as the sandbox user
+        // (e.g. an SSH-spawned shell) could read /proc/<entrypoint_pid>/environ
+        // and recover the gateway-minted JWT. Issue #1354.
+        cmd.env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN)
+            .env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
+            .env_remove(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE);
+
         inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workdir {
@@ -802,21 +803,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn harden_child_process_marks_process_nondumpable() {
         assert_eq!(probe_hardened_child(dumpable_flag_probe), 0);
-    }
-
-    #[tokio::test]
-    async fn scrub_sensitive_env_removes_ssh_handshake_secret() {
-        let mut cmd = Command::new("/usr/bin/env");
-        cmd.stdin(StdStdio::null())
-            .stdout(StdStdio::piped())
-            .stderr(StdStdio::null())
-            .env(SSH_HANDSHAKE_SECRET_ENV, "super-secret");
-
-        scrub_sensitive_env(&mut cmd);
-
-        let output = cmd.output().await.expect("spawn env");
-        let stdout = String::from_utf8(output.stdout).expect("utf8");
-        assert!(!stdout.contains(SSH_HANDSHAKE_SECRET_ENV));
     }
 
     #[tokio::test]

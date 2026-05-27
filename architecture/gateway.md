@@ -23,8 +23,12 @@ identity.
 ## Protocol and Auth
 
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
-The default deployment mode is mTLS: clients and sandbox workloads present a
-certificate signed by the deployment CA before reaching application handlers.
+The default local single-user deployment mode is mTLS user authentication:
+clients present a certificate signed by the local deployment CA, and the
+gateway maps the verified certificate subject to a user principal. Kubernetes
+deployments use mTLS for transport only and require OIDC or a trusted access
+proxy for user authentication unless the explicit unsafe local-development
+`allow_unauthenticated_users` switch is enabled.
 When that service port is bound to loopback, the listener can also accept
 plaintext HTTP on the same port for sandbox service subdomains only. That local
 browser path is enabled by default and disabled with
@@ -37,14 +41,44 @@ Supported auth modes:
 
 | Mode | Use |
 |---|---|
-| mTLS | Default direct gateway access for CLI, SDK, TUI, and sandbox callbacks. |
+| mTLS user auth | Local single-user Docker, Podman, and VM gateway access. |
 | Plaintext | Local development or a trusted reverse proxy boundary. |
+| Unauthenticated local users | Trusted Kubernetes dev or fully trusted proxy deployments only. |
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
 | OIDC | Bearer-token auth for users, with browser PKCE or client credentials login. |
 
-Sandbox supervisor RPCs authenticate with either mTLS material or a sandbox
-secret depending on the runtime and deployment mode. User-facing mutations are
-authorized by role policy when OIDC or edge identity is enabled.
+Sandbox supervisor RPCs authenticate with gateway-minted sandbox JWTs when that
+authenticator is configured; mTLS does not grant sandbox identity. User-facing
+mutations are authorized by role policy when OIDC or edge identity is enabled.
+
+Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
+Podman, and VM drivers deliver the initial token through supervisor-only
+runtime material; Kubernetes supervisors exchange a projected ServiceAccount
+token through `IssueSandboxToken`. The gateway validates that projected token
+with Kubernetes `TokenReview`, requires the configured sandbox service account,
+checks the returned pod binding against the live pod UID, and verifies the pod's
+controlling `Sandbox` ownerReference against the live Sandbox CR UID and
+sandbox-id label before minting the gateway JWT. Supervisors renew gateway JWTs
+in memory before expiry only while the sandbox record still exists. Older tokens
+are not server-revoked; deployments bound replay exposure with short
+`gateway_jwt.ttl_secs` lifetimes.
+
+Gateway JWT signing-key rotation is currently an offline operator action. The
+runtime loads one active signing key and one matching public verification key
+from the configured secret at startup. To rotate that key material today,
+operators must delete or replace the JWT key secret, let certgen recreate it,
+and restart the gateway pods. This invalidates outstanding supervisor tokens;
+running supervisors recover by re-running their bootstrap path where available
+or by reconnecting after sandbox restart. Online rotation with multiple
+verification keys keyed by `kid` is tracked separately.
+
+Sandbox JWTs are not user credentials. The gRPC router accepts
+`Principal::Sandbox` only on the supervisor-to-gateway RPC allowlist
+(`ConnectSupervisor`, `RelayStream`, token renewal, config sync, policy status,
+log push, and policy-analysis callbacks). Handlers then compare the
+authenticated sandbox ID with any sandbox ID or name resolved from the request.
+Supervisor control and relay streams require a matching sandbox principal before
+the gateway registers the session or bridges relay bytes.
 
 ## API Surface
 
@@ -83,6 +117,7 @@ The storage schema is intentionally narrow:
 | `version` | Optional monotonically increasing version for scoped records. |
 | `status` | Optional workflow state for records such as policy revisions or draft policy chunks. |
 | `dedup_key` and `hit_count` | Optional policy-advisor fields for coalescing repeated observations. |
+| `resource_version` | Monotonically increasing counter for optimistic concurrency control. Incremented atomically on each update. |
 | `payload` | Prost-encoded protobuf payload for the full domain object. |
 | `created_at_ms` and `updated_at_ms` | Gateway timestamps used for ordering and list output. |
 | `labels` | JSON object carrying Kubernetes-style object labels for filtering and organization. |
@@ -104,8 +139,100 @@ This keeps the gateway data model portable across storage backends and leaves
 room for future stores that can provide the same object, label, version, and
 scope semantics.
 
+The SQLite adapter tightens the on-disk database file to mode `0o600` on every
+connect so that provider API keys, SSH session tokens, and sandbox metadata are
+not readable by other local users on shared hosts. The same restriction is
+reapplied to the `<db>-wal` and `<db>-shm` sidecars (created by SQLite's
+default WAL journal mode), which mirror the same sensitive contents.
+
 Persisted state includes sandboxes, providers, SSH sessions, policy revisions,
 settings, inference configuration, and deployment records.
+
+### Optimistic Concurrency (CAS)
+
+Every object row carries a `resource_version` that the database increments
+atomically on each write. Concurrent mutations use compare-and-swap (CAS): the
+writer reads the current version, applies changes, and writes back with a
+`WHERE resource_version = <expected>` guard. If another writer updated the row
+in between, the guard fails and the caller receives a `Conflict` error.
+
+This matters for HA deployments where multiple gateway replicas share the same
+Postgres database, and for single-node deployments where concurrent gRPC
+handlers or the reconciler mutate the same sandbox.
+
+**Compile-time enforcement.** The unconditional write methods `put` and
+`put_message` are gated behind `#[cfg(test)]`. Production code must use
+`put_if` with an explicit `WriteCondition` or `update_message_cas`. The
+compiler rejects any other write path, making non-CAS writes structurally
+impossible outside of tests.
+
+Every write goes through one of three conditions:
+
+- `MustCreate` -- insert-only. The database rejects the write with a
+  `UniqueViolation` error if a row with that ID already exists. Handlers match
+  on the structured `PersistenceError::UniqueViolation { .. }` variant to
+  distinguish creation conflicts from other failures.
+- `MatchResourceVersion(v)` -- update-only. The database rejects the write
+  with a `Conflict` error if the current version differs from `v`.
+- `Unconditional` -- test-only; not reachable in production builds.
+
+**Creates.** All create paths use `MustCreate` and hydrate the response
+directly from the `WriteResult` returned by `put_if`, which carries the
+assigned `resource_version`, `created_at_ms`, and `updated_at_ms`. This
+eliminates a read-after-write round trip and the race window that would come
+with it.
+
+**Updates.** The `update_message_cas` helper makes a single CAS attempt: it
+fetches the current object, applies a mutation closure, and writes with a
+`MatchResourceVersion` condition. On conflict the persistence layer returns a
+`Conflict` error, which gRPC handlers map to `ABORTED` status so the client
+(or the next watch/reconcile event) can retry with fresh state. There is no
+automatic retry loop.
+
+The helper accepts an `expected_version` parameter that selects between two
+modes:
+
+- **Server-driven** (`expected_version = 0`): the helper uses the version it
+  just read from the database. Internal operations (reconciler, policy status
+  reports, compute phase transitions) use this mode because the caller does
+  not track versions.
+- **Client-driven** (`expected_version != 0`): the helper validates that the
+  caller's version matches the current database version before applying the
+  mutation. If they diverge it returns `Conflict` without attempting the
+  write. Client-facing operations that carry an `expected_resource_version`
+  field use this mode: `AttachSandboxProvider`, `DetachSandboxProvider`,
+  `UpdateProvider`, and `UpdateConfig` (policy backfill path).
+
+**Lists.** The `list_messages` and `list_messages_with_selector` helpers decode
+protobuf payloads from list results and hydrate `resource_version` from the
+authoritative database column into each decoded message, mirroring the
+`get_message` pattern. This ensures list responses carry correct versions
+without requiring callers to manually hydrate each record.
+
+**Deletes.** Delete operations are not yet CAS-protected -- the delete request
+protos do not carry `expected_resource_version`. A `delete_if` primitive exists
+in the persistence layer but is not wired into gRPC handlers.
+
+**Coverage.** All `ObjectMeta`-bearing message types have write-condition
+coverage:
+
+| Type | Create | Update | List |
+|---|---|---|---|
+| Sandbox | `MustCreate` | `update_message_cas` | `list_messages` |
+| Provider | `MustCreate` | `update_message_cas` | `list_messages` |
+| ProviderProfile | `MustCreate` | (immutable) | `list_messages` |
+| InferenceRoute | `MustCreate` | `update_message_cas` | `list_messages` |
+| SandboxPolicy | scoped versioning | scoped versioning | scoped query |
+| Settings | `Mutex`-guarded | `Mutex`-guarded | single-row |
+
+Global settings updates use a Tokio `Mutex` to serialize multi-step
+validation within a single gateway process, with CAS on the underlying
+persistence write as defense in depth. In an HA deployment with multiple
+gateways, the Mutex alone would be insufficient. Sandbox-scoped settings
+rely entirely on CAS without a Mutex.
+
+The `resource_version` is surfaced to clients through `ObjectMeta` in proto
+responses. Database migrations backfill existing rows with version 1.
 
 Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The
@@ -187,12 +314,53 @@ pre-created Secrets) disable the Helm hook via `pkiInitJob.enabled=false`.
 The chart also ships a `certManager.*` path that produces equivalent Secrets
 through cert-manager `Issuer`/`Certificate` resources.
 
+## Configuration
+
+The gateway reads its configuration from three sources, merged in this
+precedence (highest first):
+
+```
+Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in default
+```
+
+The TOML file is opt-in via `--config <PATH>` / `OPENSHELL_GATEWAY_CONFIG`.
+Driver implementation settings live in the TOML driver tables. See
+`docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
+0003 for the full schema.
+
+`database_url` is env-only and rejected when present in the file
+(`OPENSHELL_DB_URL` / `--db-url`).
+
+### Driver inheritance
+
+`[openshell.gateway]` carries a small set of values (`sandbox_namespace`,
+`default_image`,
+`supervisor_image`, `guest_tls_ca/cert/key`, `client_tls_secret_name`,
+`host_gateway_ip`, `enable_user_namespaces`) that are inherited into each
+driver's `[openshell.drivers.<name>]` table when the driver-specific table
+does not override them. The allowlist is per-driver so a gateway-wide
+default cannot land in a driver that does not understand it (e.g.
+`client_tls_secret_name` is K8s-only).
+
+`image_pull_policy` is intentionally **not** inheritable: Kubernetes uses
+`Always | IfNotPresent | Never` (passed verbatim to the K8s API) while
+Podman uses the lowercase enum `always | missing | never | newer`. No
+value means the same thing in both, so the key lives only under each
+driver's own table.
+
+Driver-specific values that are not part of the inheritance allowlist
+(e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
+table.
+
 ## Operational Constraints
 
 - Gateway TLS and client certificate distribution are deployment concerns owned
   by the operator or packaging layer.
 - Compute runtimes own the mechanics of starting workloads and injecting
   callback configuration.
+- Docker-backed local gateways use Docker's `host-gateway` callback alias on
+  macOS and Docker Desktop-style runtimes. Native Linux Docker may expose an
+  additional bridge-gateway listener because the host can bind that bridge IP.
 - Gateway restarts recover persisted objects from storage, but live relay
   streams must be re-established by supervisors.
 - User-facing behavior changes must update published docs in `docs/`; this file

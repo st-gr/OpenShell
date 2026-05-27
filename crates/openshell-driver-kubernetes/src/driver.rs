@@ -3,7 +3,10 @@
 
 //! Kubernetes compute driver.
 
-use crate::config::{KubernetesComputeConfig, SupervisorSideloadMethod};
+use crate::config::{
+    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig,
+    SupervisorSideloadMethod,
+};
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
@@ -11,6 +14,13 @@ use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
+use openshell_core::driver_utils::{
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, SUPERVISOR_IMAGE_BINARY_PATH,
+};
+use openshell_core::progress::{
+    PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
+    mark_progress_active, mark_progress_complete, mark_progress_detail,
+};
 use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
@@ -47,6 +57,16 @@ impl KubernetesDriverError {
     }
 }
 
+impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
+    fn from(err: KubernetesDriverError) -> Self {
+        match err {
+            KubernetesDriverError::AlreadyExists => Self::AlreadyExists,
+            KubernetesDriverError::Precondition(m) => Self::Precondition(m),
+            KubernetesDriverError::Message(m) => Self::Message(m),
+        }
+    }
+}
+
 /// Timeout for individual Kubernetes API calls (create, delete, get).
 /// This prevents gRPC handlers from blocking indefinitely when the k8s
 /// API server is unreachable or slow.
@@ -55,9 +75,7 @@ const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 const SANDBOX_GROUP: &str = "agents.x-k8s.io";
 const SANDBOX_VERSION: &str = "v1alpha1";
 pub const SANDBOX_KIND: &str = "Sandbox";
-const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
-const SANDBOX_MANAGED_LABEL: &str = "openshell.ai/managed-by";
-const SANDBOX_MANAGED_VALUE: &str = "openshell";
+
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const GPU_RESOURCE_QUANTITY: &str = "1";
 
@@ -91,9 +109,6 @@ const WORKSPACE_INIT_MOUNT_PATH: &str = "/workspace-pvc";
 
 /// Name of the init container that seeds the workspace PVC.
 const WORKSPACE_INIT_CONTAINER_NAME: &str = "workspace-init";
-
-/// Default storage request for the workspace PVC.
-const WORKSPACE_DEFAULT_STORAGE: &str = "2Gi";
 
 /// Sentinel file written by the init container after copying the image's
 /// `/sandbox` contents.  Subsequent pod starts skip the copy.
@@ -145,13 +160,12 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
-        Ok(GetCapabilitiesResponse {
-            driver_name: "kubernetes".to_string(),
-            driver_version: openshell_core::VERSION.to_string(),
-            default_image: self.config.default_image.clone(),
-            supports_gpu: self.has_gpu_capacity().await.unwrap_or(false),
-            gpu_count: 0,
-        })
+        Ok(openshell_core::driver_utils::build_capabilities_response(
+            "kubernetes",
+            openshell_core::VERSION,
+            &self.config.default_image,
+            self.has_gpu_capacity().await.unwrap_or(false),
+        ))
     }
 
     pub fn default_image(&self) -> &str {
@@ -164,10 +178,6 @@ impl KubernetesComputeDriver {
 
     pub fn ssh_socket_path(&self) -> &str {
         &self.config.ssh_socket_path
-    }
-
-    pub const fn ssh_handshake_skew_secs(&self) -> u64 {
-        self.config.ssh_handshake_skew_secs
     }
 
     fn watch_api(&self) -> Api<DynamicObject> {
@@ -286,10 +296,6 @@ impl KubernetesComputeDriver {
         }
     }
 
-    fn ssh_handshake_secret(&self) -> &str {
-        &self.config.ssh_handshake_secret
-    }
-
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
         let name = sandbox.name.as_str();
         info!(
@@ -314,15 +320,16 @@ impl KubernetesComputeDriver {
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
+            service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
             grpc_endpoint: &self.config.grpc_endpoint,
             ssh_socket_path: self.ssh_socket_path(),
-            ssh_handshake_secret: self.ssh_handshake_secret(),
-            ssh_handshake_skew_secs: self.ssh_handshake_skew_secs(),
             client_tls_secret_name: &self.config.client_tls_secret_name,
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
+            workspace_default_storage_size: &self.config.workspace_default_storage_size,
+            sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
         };
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
         let api = self.api();
@@ -547,17 +554,17 @@ impl KubernetesComputeDriver {
 
 fn sandbox_labels(sandbox: &Sandbox) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
-    labels.insert(SANDBOX_ID_LABEL.to_string(), sandbox.id.clone());
+    labels.insert(LABEL_SANDBOX_ID.to_string(), sandbox.id.clone());
     labels.insert(
-        SANDBOX_MANAGED_LABEL.to_string(),
-        SANDBOX_MANAGED_VALUE.to_string(),
+        LABEL_MANAGED_BY.to_string(),
+        LABEL_MANAGED_BY_VALUE.to_string(),
     );
     labels
 }
 
 fn sandbox_id_from_object(obj: &DynamicObject) -> Result<String, String> {
     if let Some(labels) = obj.metadata.labels.as_ref()
-        && let Some(id) = labels.get(SANDBOX_ID_LABEL)
+        && let Some(id) = labels.get(LABEL_SANDBOX_ID)
     {
         return Ok(id.clone());
     }
@@ -646,6 +653,11 @@ fn map_kube_event_to_platform(
     if let Some(count) = obj.count {
         metadata.insert("count".to_string(), count.to_string());
     }
+    attach_kube_progress_metadata(
+        &mut metadata,
+        obj.reason.as_deref().unwrap_or_default(),
+        obj.message.as_deref().unwrap_or_default(),
+    );
 
     Some((
         sandbox_id,
@@ -658,6 +670,76 @@ fn map_kube_event_to_platform(
             metadata,
         },
     ))
+}
+
+fn attach_kube_progress_metadata(
+    metadata: &mut std::collections::HashMap<String, String>,
+    reason: &str,
+    message: &str,
+) {
+    match reason {
+        "Scheduled" => {
+            mark_progress_complete(
+                metadata,
+                PROGRESS_STEP_REQUESTING_SANDBOX,
+                "Sandbox allocated",
+            );
+            mark_progress_active(metadata, PROGRESS_STEP_PULLING_IMAGE);
+        }
+        "Pulling" => {
+            mark_progress_active(metadata, PROGRESS_STEP_PULLING_IMAGE);
+            if let Some(image) = pulling_image_from_kube_message(message) {
+                mark_progress_detail(metadata, image);
+            }
+        }
+        "Pulled" => {
+            let label = pulled_image_label(message);
+            mark_progress_complete(metadata, PROGRESS_STEP_PULLING_IMAGE, label);
+            mark_progress_active(metadata, PROGRESS_STEP_STARTING_SANDBOX);
+        }
+        _ => {}
+    }
+}
+
+fn pulling_image_from_kube_message(message: &str) -> Option<String> {
+    let image = message
+        .strip_prefix("Pulling image ")
+        .map(str::trim)
+        .map(|value| value.trim_matches('"'))?;
+    (!image.is_empty()).then(|| image.to_string())
+}
+
+fn pulled_image_label(message: &str) -> String {
+    extract_image_size(message).map_or_else(
+        || "Image pulled".to_string(),
+        |bytes| format!("Image pulled ({})", format_bytes(bytes)),
+    )
+}
+
+fn extract_image_size(message: &str) -> Option<u64> {
+    let size_prefix = "Image size: ";
+    let start = message.find(size_prefix)? + size_prefix.len();
+    let rest = &message[start..];
+    let end = rest.find(' ')?;
+    rest[..end].parse().ok()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        #[allow(clippy::cast_precision_loss)]
+        let gb = bytes as f64 / GB as f64;
+        format!("{gb:.1} GB")
+    } else if bytes >= MB {
+        format!("{} MB", bytes / MB)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Path where the supervisor binary is mounted inside the agent container.
@@ -687,13 +769,6 @@ fn supervisor_volume_mount() -> serde_json::Value {
         "readOnly": true
     })
 }
-
-/// Path of the supervisor binary inside the supervisor image.
-///
-/// The supervisor image places the binary at the filesystem root. We invoke
-/// it directly so the init path does not depend on shell utilities or PATH
-/// resolution inside the image.
-const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
 
 /// Build an image volume that mounts the supervisor OCI image directly.
 ///
@@ -946,7 +1021,12 @@ fn apply_workspace_persistence(
 ///
 /// Provides a single PVC named "workspace" that backs the `/sandbox`
 /// directory.  The init container seeds it from the image on first use.
-fn default_workspace_volume_claim_templates() -> serde_json::Value {
+fn default_workspace_volume_claim_templates(storage_size: &str) -> serde_json::Value {
+    let size = if storage_size.is_empty() {
+        DEFAULT_WORKSPACE_STORAGE_SIZE
+    } else {
+        storage_size
+    };
     serde_json::json!([{
         "metadata": {
             "name": WORKSPACE_VOLUME_NAME
@@ -955,7 +1035,7 @@ fn default_workspace_volume_claim_templates() -> serde_json::Value {
             "accessModes": ["ReadWriteOnce"],
             "resources": {
                 "requests": {
-                    "storage": WORKSPACE_DEFAULT_STORAGE
+                    "storage": size
                 }
             }
         }
@@ -963,28 +1043,55 @@ fn default_workspace_volume_claim_templates() -> serde_json::Value {
 }
 
 /// Parameters shared by `sandbox_to_k8s_spec` and `sandbox_template_to_k8s`.
-#[derive(Default)]
 struct SandboxPodParams<'a> {
     default_image: &'a str,
     image_pull_policy: &'a str,
     supervisor_image: &'a str,
     supervisor_image_pull_policy: &'a str,
     supervisor_sideload_method: SupervisorSideloadMethod,
+    service_account_name: &'a str,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
     grpc_endpoint: &'a str,
     ssh_socket_path: &'a str,
-    ssh_handshake_secret: &'a str,
-    ssh_handshake_skew_secs: u64,
     client_tls_secret_name: &'a str,
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
+    workspace_default_storage_size: &'a str,
+    /// Lifetime (seconds) of the projected `ServiceAccount` token used
+    /// for the bootstrap `IssueSandboxToken` exchange.
+    sa_token_ttl_secs: i64,
+}
+
+impl Default for SandboxPodParams<'_> {
+    fn default() -> Self {
+        Self {
+            default_image: "",
+            image_pull_policy: "",
+            supervisor_image: "",
+            supervisor_image_pull_policy: "",
+            supervisor_sideload_method: SupervisorSideloadMethod::default(),
+            service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
+            sandbox_id: "",
+            sandbox_name: "",
+            grpc_endpoint: "",
+            ssh_socket_path: "",
+            client_tls_secret_name: "",
+            host_gateway_ip: "",
+            enable_user_namespaces: false,
+            workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
+            sa_token_ttl_secs: 3600,
+        }
+    }
 }
 
 fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String, String> {
     let mut env = spec.map_or_else(Default::default, |s| s.environment.clone());
     if let Some(s) = spec.filter(|s| !s.log_level.is_empty()) {
-        env.insert("OPENSHELL_LOG_LEVEL".to_string(), s.log_level.clone());
+        env.insert(
+            openshell_core::sandbox_env::LOG_LEVEL.to_string(),
+            s.log_level.clone(),
+        );
     }
     env
 }
@@ -1032,7 +1139,7 @@ fn sandbox_to_k8s_spec(
     if inject_workspace {
         root.insert(
             "volumeClaimTemplates".to_string(),
-            default_workspace_volume_claim_templates(),
+            default_workspace_volume_claim_templates(params.workspace_default_storage_size),
         );
     }
 
@@ -1067,8 +1174,29 @@ fn sandbox_template_to_k8s(
     if !template.labels.is_empty() {
         metadata.insert("labels".to_string(), serde_json::json!(template.labels));
     }
-    if let Some(annotations) = platform_config_struct(template, "annotations") {
-        metadata.insert("annotations".to_string(), annotations);
+    // Carry the sandbox UUID as a pod annotation so the gateway can resolve
+    // a projected SA token claim (pod name + uid) back to a sandbox identity
+    // when the supervisor calls `IssueSandboxToken` at startup. The gateway
+    // also verifies the pod's controlling Sandbox ownerReference against the
+    // live CR before accepting this annotation. Its K8s Role does NOT grant
+    // `patch pods`, so this annotation is effectively immutable post-create.
+    let mut pod_annotations = platform_config_struct(template, "annotations")
+        .and_then(|v| match v {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if !params.sandbox_id.is_empty() {
+        pod_annotations.insert(
+            "openshell.io/sandbox-id".to_string(),
+            serde_json::Value::String(params.sandbox_id.to_string()),
+        );
+    }
+    if !pod_annotations.is_empty() {
+        metadata.insert(
+            "annotations".to_string(),
+            serde_json::Value::Object(pod_annotations),
+        );
     }
 
     let mut spec = serde_json::Map::new();
@@ -1097,6 +1225,13 @@ fn sandbox_template_to_k8s(
                  NVIDIA device plugin compatibility is unverified"
             );
         }
+    }
+
+    if !params.service_account_name.is_empty() {
+        spec.insert(
+            "serviceAccountName".to_string(),
+            serde_json::json!(params.service_account_name),
+        );
     }
 
     // Disable service account token auto-mounting for security hardening.
@@ -1133,8 +1268,6 @@ fn sandbox_template_to_k8s(
         params.sandbox_name,
         params.grpc_endpoint,
         params.ssh_socket_path,
-        params.ssh_handshake_secret,
-        params.ssh_handshake_skew_secs,
         !params.client_tls_secret_name.is_empty(),
     );
 
@@ -1157,17 +1290,26 @@ fn sandbox_template_to_k8s(
         }),
     );
 
-    // Mount client TLS secret for mTLS to the server.
+    // Mount client TLS secret for mTLS to the server, plus the projected
+    // ServiceAccount token used to bootstrap the sandbox's gateway JWT
+    // via `IssueSandboxToken`.
+    let mut volume_mounts: Vec<serde_json::Value> = Vec::new();
     if !params.client_tls_secret_name.is_empty() {
-        container.insert(
-            "volumeMounts".to_string(),
-            serde_json::json!([{
-                "name": "openshell-client-tls",
-                "mountPath": "/etc/openshell-tls/client",
-                "readOnly": true
-            }]),
-        );
+        volume_mounts.push(serde_json::json!({
+            "name": "openshell-client-tls",
+            "mountPath": "/etc/openshell-tls/client",
+            "readOnly": true
+        }));
     }
+    volume_mounts.push(serde_json::json!({
+        "name": "openshell-sa-token",
+        "mountPath": "/var/run/secrets/openshell",
+        "readOnly": true,
+    }));
+    container.insert(
+        "volumeMounts".to_string(),
+        serde_json::Value::Array(volume_mounts),
+    );
 
     if let Some(resources) = container_resources(template, gpu) {
         container.insert("resources".to_string(), resources);
@@ -1179,15 +1321,31 @@ fn sandbox_template_to_k8s(
 
     // Add TLS secret volume.  Mode 0400 (owner-read) prevents the
     // unprivileged sandbox user from reading the mTLS private key.
+    let mut volumes: Vec<serde_json::Value> = Vec::new();
     if !params.client_tls_secret_name.is_empty() {
-        spec.insert(
-            "volumes".to_string(),
-            serde_json::json!([{
-                "name": "openshell-client-tls",
-                "secret": { "secretName": params.client_tls_secret_name, "defaultMode": 256 }
-            }]),
-        );
+        volumes.push(serde_json::json!({
+            "name": "openshell-client-tls",
+            "secret": { "secretName": params.client_tls_secret_name, "defaultMode": 256 }
+        }));
     }
+    // Projected ServiceAccountToken volume — kubelet writes a short-lived
+    // audience-bound JWT into /var/run/secrets/openshell/token and rotates
+    // it automatically. The supervisor exchanges this for a gateway-minted
+    // JWT via `IssueSandboxToken` once at startup.
+    volumes.push(serde_json::json!({
+        "name": "openshell-sa-token",
+        "projected": {
+            "sources": [{
+                "serviceAccountToken": {
+                    "audience": "openshell-gateway",
+                    "expirationSeconds": params.sa_token_ttl_secs,
+                    "path": "token"
+                }
+            }],
+            "defaultMode": 256
+        }
+    }));
+    spec.insert("volumes".to_string(), serde_json::Value::Array(volumes));
 
     // Add hostAliases so sandbox pods can reach the Docker host.
     if !params.host_gateway_ip.is_empty() {
@@ -1241,10 +1399,21 @@ fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_js
                 sec[key] = serde_json::json!(value);
             }
         };
-        apply("requests", "cpu", &req.cpu_request);
-        apply("requests", "memory", &req.memory_request);
         apply("limits", "cpu", &req.cpu_limit);
         apply("limits", "memory", &req.memory_limit);
+
+        let cpu_request = if req.cpu_request.is_empty() {
+            &req.cpu_limit
+        } else {
+            &req.cpu_request
+        };
+        let memory_request = if req.memory_request.is_empty() {
+            &req.memory_limit
+        } else {
+            &req.memory_request
+        };
+        apply("requests", "cpu", cpu_request);
+        apply("requests", "memory", memory_request);
     }
 
     if gpu {
@@ -1286,8 +1455,6 @@ fn build_env_list(
     sandbox_name: &str,
     grpc_endpoint: &str,
     ssh_socket_path: &str,
-    ssh_handshake_secret: &str,
-    ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
 ) -> Vec<serde_json::Value> {
     let mut env = existing_env.cloned().unwrap_or_default();
@@ -1299,8 +1466,6 @@ fn build_env_list(
         sandbox_name,
         grpc_endpoint,
         ssh_socket_path,
-        ssh_handshake_secret,
-        ssh_handshake_skew_secs,
         tls_enabled,
     );
     env
@@ -1317,45 +1482,56 @@ fn apply_env_map(
 
 // Required env vars are passed individually for clarity at call sites; grouping into a struct
 // would not improve readability for this internal helper.
-#[allow(clippy::too_many_arguments)]
 fn apply_required_env(
     env: &mut Vec<serde_json::Value>,
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
     ssh_socket_path: &str,
-    ssh_handshake_secret: &str,
-    ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
 ) {
-    upsert_env(env, "OPENSHELL_SANDBOX_ID", sandbox_id);
-    upsert_env(env, "OPENSHELL_SANDBOX", sandbox_name);
-    upsert_env(env, "OPENSHELL_ENDPOINT", grpc_endpoint);
-    upsert_env(env, "OPENSHELL_SANDBOX_COMMAND", "sleep infinity");
-    if !ssh_socket_path.is_empty() {
-        upsert_env(env, "OPENSHELL_SSH_SOCKET_PATH", ssh_socket_path);
-    }
-    upsert_env(env, "OPENSHELL_SSH_HANDSHAKE_SECRET", ssh_handshake_secret);
+    upsert_env(env, openshell_core::sandbox_env::SANDBOX_ID, sandbox_id);
+    upsert_env(env, openshell_core::sandbox_env::SANDBOX, sandbox_name);
+    upsert_env(env, openshell_core::sandbox_env::ENDPOINT, grpc_endpoint);
     upsert_env(
         env,
-        "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS",
-        &ssh_handshake_skew_secs.to_string(),
+        openshell_core::sandbox_env::SANDBOX_COMMAND,
+        "sleep infinity",
     );
+    if !ssh_socket_path.is_empty() {
+        upsert_env(
+            env,
+            openshell_core::sandbox_env::SSH_SOCKET_PATH,
+            ssh_socket_path,
+        );
+    }
     // TLS cert paths for sandbox-to-server mTLS. Only set when TLS is enabled
     // and the client TLS secret is mounted into the sandbox pod.
     if tls_enabled {
-        upsert_env(env, "OPENSHELL_TLS_CA", "/etc/openshell-tls/client/ca.crt");
         upsert_env(
             env,
-            "OPENSHELL_TLS_CERT",
+            openshell_core::sandbox_env::TLS_CA,
+            "/etc/openshell-tls/client/ca.crt",
+        );
+        upsert_env(
+            env,
+            openshell_core::sandbox_env::TLS_CERT,
             "/etc/openshell-tls/client/tls.crt",
         );
         upsert_env(
             env,
-            "OPENSHELL_TLS_KEY",
+            openshell_core::sandbox_env::TLS_KEY,
             "/etc/openshell-tls/client/tls.key",
         );
     }
+    // Projected ServiceAccount token written by kubelet (see the volume
+    // definition in `sandbox_template_to_k8s`). The supervisor reads this
+    // and exchanges it for a gateway-minted JWT via `IssueSandboxToken`.
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
+        "/var/run/secrets/openshell/token",
+    );
 }
 
 fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
@@ -1492,31 +1668,55 @@ fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::progress::{
+        PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
+        PROGRESS_COMPLETE_STEP_KEY,
+    };
     use prost_types::{Struct, Value, value::Kind};
 
     #[test]
-    fn apply_required_env_always_injects_ssh_handshake_secret() {
-        let mut env = Vec::new();
-        apply_required_env(
-            &mut env,
-            "sandbox-1",
-            "my-sandbox",
-            "https://endpoint:8080",
-            "0.0.0.0:2222",
-            "my-secret-value",
-            300,
-            true,
+    fn kube_pulling_event_adds_image_progress_metadata() {
+        let mut metadata = std::collections::HashMap::new();
+
+        attach_kube_progress_metadata(
+            &mut metadata,
+            "Pulling",
+            "Pulling image \"ghcr.io/acme/sandbox:latest\"",
         );
 
-        let secret_entry = env
-            .iter()
-            .find(|e| {
-                e.get("name").and_then(|v| v.as_str()) == Some("OPENSHELL_SSH_HANDSHAKE_SECRET")
-            })
-            .expect("OPENSHELL_SSH_HANDSHAKE_SECRET must be present in env");
         assert_eq!(
-            secret_entry.get("value").and_then(|v| v.as_str()),
-            Some("my-secret-value")
+            metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
+            Some(PROGRESS_STEP_PULLING_IMAGE)
+        );
+        assert_eq!(
+            metadata.get(PROGRESS_ACTIVE_DETAIL_KEY).map(String::as_str),
+            Some("ghcr.io/acme/sandbox:latest")
+        );
+    }
+
+    #[test]
+    fn kube_pulled_event_adds_completed_image_progress_metadata() {
+        let mut metadata = std::collections::HashMap::new();
+
+        attach_kube_progress_metadata(
+            &mut metadata,
+            "Pulled",
+            "Successfully pulled image \"ghcr.io/acme/sandbox:latest\". Image size: 44040192 bytes.",
+        );
+
+        assert_eq!(
+            metadata.get(PROGRESS_COMPLETE_STEP_KEY).map(String::as_str),
+            Some(PROGRESS_STEP_PULLING_IMAGE)
+        );
+        assert_eq!(
+            metadata
+                .get(PROGRESS_COMPLETE_LABEL_KEY)
+                .map(String::as_str),
+            Some("Image pulled (42 MB)")
+        );
+        assert_eq!(
+            metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
+            Some(PROGRESS_STEP_STARTING_SANDBOX)
         );
     }
 
@@ -1750,8 +1950,6 @@ mod tests {
             "my-sandbox",
             "https://endpoint:8080",
             "0.0.0.0:2222",
-            "secret",
-            300,
             true, // tls_enabled
         );
 
@@ -1896,6 +2094,36 @@ mod tests {
             limits[GPU_RESOURCE_NAME],
             serde_json::json!(GPU_RESOURCE_QUANTITY)
         );
+    }
+
+    #[test]
+    fn cpu_and_memory_limits_are_mirrored_to_requests() {
+        use openshell_core::proto::compute::v1::DriverResourceRequirements;
+        let template = SandboxTemplate {
+            resources: Some(DriverResourceRequirements {
+                cpu_limit: "500m".to_string(),
+                memory_limit: "2Gi".to_string(),
+                ..Default::default()
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        let resources = &pod_template["spec"]["containers"][0]["resources"];
+        assert_eq!(resources["limits"]["cpu"], serde_json::json!("500m"));
+        assert_eq!(resources["limits"]["memory"], serde_json::json!("2Gi"));
+        assert_eq!(resources["requests"]["cpu"], serde_json::json!("500m"));
+        assert_eq!(resources["requests"]["memory"], serde_json::json!("2Gi"));
     }
 
     #[test]
@@ -2276,6 +2504,32 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_template_sets_configured_service_account_name() {
+        let params = SandboxPodParams {
+            service_account_name: "openshell-sandbox",
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["serviceAccountName"],
+            serde_json::json!("openshell-sandbox"),
+            "sandbox pods must run under the configured service account"
+        );
+        assert_eq!(
+            pod_template["spec"]["automountServiceAccountToken"],
+            serde_json::json!(false),
+            "explicit service account selection must not re-enable default token automounting"
+        );
+    }
+
+    #[test]
     fn platform_config_bool_extracts_value() {
         let template = SandboxTemplate {
             platform_config: Some(Struct {
@@ -2431,5 +2685,19 @@ mod tests {
         assert_eq!(tolerations[0]["key"], "nvidia.com/gpu");
         assert_eq!(tolerations[0]["operator"], "Exists");
         assert_eq!(tolerations[0]["effect"], "NoSchedule");
+    }
+
+    #[test]
+    fn default_workspace_vct_uses_provided_storage_size() {
+        let vct = default_workspace_volume_claim_templates("5Gi");
+        let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
+        assert_eq!(storage, "5Gi");
+    }
+
+    #[test]
+    fn default_workspace_vct_falls_back_to_const_when_empty() {
+        let vct = default_workspace_volume_claim_templates("");
+        let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
+        assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
     }
 }

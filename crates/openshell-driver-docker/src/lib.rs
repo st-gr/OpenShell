@@ -19,6 +19,10 @@ use bollard::query_parameters::{
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use openshell_core::config::{DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_STOP_TIMEOUT_SECS};
+use openshell_core::driver_utils::{
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
+    LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH,
+};
 use openshell_core::gpu::cdi_gpu_device_ids;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
@@ -47,16 +51,11 @@ const WATCH_BUFFER: usize = 128;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-const MANAGED_BY_LABEL_KEY: &str = "openshell.ai/managed-by";
-const MANAGED_BY_LABEL_VALUE: &str = "openshell";
-const SANDBOX_ID_LABEL_KEY: &str = "openshell.ai/sandbox-id";
-const SANDBOX_NAME_LABEL_KEY: &str = "openshell.ai/sandbox-name";
-const SANDBOX_NAMESPACE_LABEL_KEY: &str = "openshell.ai/sandbox-namespace";
-
 const SUPERVISOR_MOUNT_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
 const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
+const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
 const SANDBOX_COMMAND: &str = "sleep infinity";
 const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
@@ -65,12 +64,8 @@ const DOCKER_NETWORK_DRIVER: &str = "bridge";
 
 /// Default image holding the Linux `openshell-sandbox` binary. The gateway
 /// pulls this image and extracts the binary to a host-side cache when no
-/// explicit `--docker-supervisor-bin` override or local build is available.
+/// explicit `supervisor_bin` override or local build is available.
 const DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
-
-/// Path to the supervisor binary inside the `openshell/supervisor` image
-/// (a `FROM scratch` image containing only the binary).
-const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
 
 /// Return the default `ghcr.io/nvidia/openshell/supervisor:<tag>` reference
 /// used when no supervisor binary override is provided.
@@ -127,8 +122,21 @@ pub trait SupervisorReadiness: Send + Sync + 'static {
 }
 
 /// Gateway-local configuration for the Docker compute driver.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct DockerComputeConfig {
+    /// Default OCI image for sandboxes.
+    pub default_image: String,
+
+    /// Image pull policy for sandbox images.
+    pub image_pull_policy: String,
+
+    /// Namespace label applied to Docker sandboxes.
+    pub sandbox_namespace: String,
+
+    /// Gateway gRPC endpoint the sandbox connects back to.
+    pub grpc_endpoint: String,
+
     /// Optional override for the Linux `openshell-sandbox` binary mounted into containers.
     pub supervisor_bin: Option<PathBuf>,
 
@@ -149,6 +157,31 @@ pub struct DockerComputeConfig {
 
     /// Docker bridge network that sandbox containers join.
     pub network_name: String,
+
+    /// Host gateway IP used for sandbox host aliases.
+    pub host_gateway_ip: String,
+
+    /// Unix socket path the in-container supervisor bridges relay traffic to.
+    pub ssh_socket_path: String,
+}
+
+impl Default for DockerComputeConfig {
+    fn default() -> Self {
+        Self {
+            default_image: openshell_core::image::default_sandbox_image(),
+            image_pull_policy: String::new(),
+            sandbox_namespace: "default".to_string(),
+            grpc_endpoint: String::new(),
+            supervisor_bin: None,
+            supervisor_image: None,
+            guest_tls_ca: None,
+            guest_tls_cert: None,
+            guest_tls_key: None,
+            network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
+            host_gateway_ip: String::new(),
+            ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,12 +240,6 @@ impl DockerComputeDriver {
         docker_config: &DockerComputeConfig,
         supervisor_readiness: Arc<dyn SupervisorReadiness>,
     ) -> CoreResult<Self> {
-        if config.grpc_endpoint.trim().is_empty() {
-            return Err(Error::config(
-                "grpc_endpoint is required when using the docker compute driver",
-            ));
-        }
-
         let docker = Docker::connect_with_local_defaults()
             .map_err(|err| Error::execution(format!("failed to create Docker client: {err}")))?;
         let version = docker.version().await.map_err(|err| {
@@ -233,28 +260,38 @@ impl DockerComputeDriver {
         }
         let network_name = docker_network_name(docker_config);
         let bridge_gateway_ip = ensure_bridge_network(&docker, &network_name).await?;
-        let host_gateway_ip = parse_optional_host_gateway_ip(&config.host_gateway_ip)?;
+        let host_gateway_ip = parse_optional_host_gateway_ip(&docker_config.host_gateway_ip)?;
         let gateway_route =
             docker_gateway_route(&info, bridge_gateway_ip, gateway_port, host_gateway_ip);
+        let mut docker_config = docker_config.clone();
+        if docker_config.grpc_endpoint.trim().is_empty() {
+            let scheme = if docker_guest_tls_configured(&docker_config) {
+                "https"
+            } else {
+                "http"
+            };
+            docker_config.grpc_endpoint =
+                format!("{scheme}://{HOST_OPENSHELL_INTERNAL}:{gateway_port}");
+        }
         let grpc_endpoint = docker_container_openshell_endpoint(
-            &config.grpc_endpoint,
+            &docker_config.grpc_endpoint,
             HOST_OPENSHELL_INTERNAL,
             gateway_port,
         );
         let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
-        let supervisor_bin = resolve_supervisor_bin(&docker, docker_config, &daemon_arch).await?;
-        let guest_tls = docker_guest_tls_paths(config, docker_config)?;
+        let supervisor_bin = resolve_supervisor_bin(&docker, &docker_config, &daemon_arch).await?;
+        let guest_tls = docker_guest_tls_paths(&docker_config)?;
 
         let driver = Self {
             docker: Arc::new(docker),
             config: DockerDriverRuntimeConfig {
-                default_image: config.sandbox_image.clone(),
-                image_pull_policy: config.sandbox_image_pull_policy.clone(),
-                sandbox_namespace: config.sandbox_namespace.clone(),
+                default_image: docker_config.default_image.clone(),
+                image_pull_policy: docker_config.image_pull_policy.clone(),
+                sandbox_namespace: docker_config.sandbox_namespace.clone(),
                 grpc_endpoint,
                 network_name,
                 gateway_route,
-                ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
+                ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
                 log_level: config.log_level.clone(),
                 supervisor_bin,
@@ -283,13 +320,12 @@ impl DockerComputeDriver {
     }
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
-        GetCapabilitiesResponse {
-            driver_name: "docker".to_string(),
-            driver_version: self.config.daemon_version.clone(),
-            default_image: self.config.default_image.clone(),
-            supports_gpu: self.config.supports_gpu,
-            gpu_count: 0,
-        }
+        openshell_core::driver_utils::build_capabilities_response(
+            "docker",
+            &self.config.daemon_version,
+            &self.config.default_image,
+            self.config.supports_gpu,
+        )
     }
 
     fn validate_sandbox(
@@ -381,6 +417,7 @@ impl DockerComputeDriver {
             .and_then(|spec| spec.template.as_ref())
             .expect("validated sandbox has template");
         self.ensure_image_available(&template.image).await?;
+        let token_file_created = write_sandbox_token_file(sandbox, &self.config).await?;
 
         let container_name = container_name_for_sandbox(sandbox);
         let create_body = build_container_create_body(sandbox, &self.config)?;
@@ -395,6 +432,9 @@ impl DockerComputeDriver {
             )
             .await
             .map_err(|err| {
+                if token_file_created {
+                    cleanup_sandbox_token_file(sandbox, &self.config);
+                }
                 create_status_from_docker_error("create docker sandbox container", err)
             })?;
 
@@ -413,6 +453,9 @@ impl DockerComputeDriver {
                     error = %cleanup_err,
                     "Failed to clean up Docker container after start failure"
                 );
+            }
+            if token_file_created {
+                cleanup_sandbox_token_file(sandbox, &self.config);
             }
             return Err(create_status_from_docker_error(
                 "start docker sandbox container",
@@ -446,8 +489,14 @@ impl DockerComputeDriver {
             )
             .await
         {
-            Ok(()) => Ok(true),
-            Err(err) if is_not_found_error(&err) => Ok(false),
+            Ok(()) => {
+                cleanup_sandbox_token_file_by_id(sandbox_id, &self.config);
+                Ok(true)
+            }
+            Err(err) if is_not_found_error(&err) => {
+                cleanup_sandbox_token_file_by_id(sandbox_id, &self.config);
+                Ok(false)
+            }
             Err(err) => Err(internal_status("delete docker sandbox container", err)),
         }
     }
@@ -644,9 +693,9 @@ impl DockerComputeDriver {
     ) -> Result<Option<ContainerSummary>, Status> {
         let mut label_filter_values = Vec::new();
         if !sandbox_id.is_empty() {
-            label_filter_values.push(format!("{SANDBOX_ID_LABEL_KEY}={sandbox_id}"));
+            label_filter_values.push(format!("{LABEL_SANDBOX_ID}={sandbox_id}"));
         } else if !sandbox_name.is_empty() {
-            label_filter_values.push(format!("{SANDBOX_NAME_LABEL_KEY}={sandbox_name}"));
+            label_filter_values.push(format!("{LABEL_SANDBOX_NAME}={sandbox_name}"));
         }
 
         let filters =
@@ -667,15 +716,15 @@ impl DockerComputeDriver {
                 return false;
             };
             let namespace_matches = labels
-                .get(SANDBOX_NAMESPACE_LABEL_KEY)
+                .get(LABEL_SANDBOX_NAMESPACE)
                 .is_some_and(|value| value == &self.config.sandbox_namespace);
             let id_matches = sandbox_id.is_empty()
                 || labels
-                    .get(SANDBOX_ID_LABEL_KEY)
+                    .get(LABEL_SANDBOX_ID)
                     .is_some_and(|value| value == sandbox_id);
             let name_matches = sandbox_name.is_empty()
                 || labels
-                    .get(SANDBOX_NAME_LABEL_KEY)
+                    .get(LABEL_SANDBOX_NAME)
                     .is_some_and(|value| value == sandbox_name);
             namespace_matches && id_matches && name_matches
         }))
@@ -694,12 +743,12 @@ impl DockerComputeDriver {
             "never" => match self.docker.inspect_image(image).await {
                 Ok(_) => Ok(()),
                 Err(err) if is_not_found_error(&err) => Err(Status::failed_precondition(format!(
-                    "docker image '{image}' is not present locally and sandbox_image_pull_policy=Never"
+                    "docker image '{image}' is not present locally and image_pull_policy=Never"
                 ))),
                 Err(err) => Err(internal_status("inspect Docker image", err)),
             },
             other => Err(Status::failed_precondition(format!(
-                "unsupported docker sandbox_image_pull_policy '{other}'; expected Always, IfNotPresent, or Never",
+                "unsupported docker image_pull_policy '{other}'; expected Always, IfNotPresent, or Never",
             ))),
         }
     }
@@ -869,7 +918,10 @@ impl ComputeDriver for DockerComputeDriver {
     }
 }
 
-fn build_binds(config: &DockerDriverRuntimeConfig) -> Vec<String> {
+fn build_binds(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<Vec<String>, Status> {
     let mut binds = vec![format!(
         "{}:{}:ro,z",
         config.supervisor_bin.display(),
@@ -884,7 +936,100 @@ fn build_binds(config: &DockerDriverRuntimeConfig) -> Vec<String> {
         ));
         binds.push(format!("{}:{}:ro,z", tls.key.display(), TLS_KEY_MOUNT_PATH));
     }
-    binds
+    if sandbox
+        .spec
+        .as_ref()
+        .is_some_and(|spec| !spec.sandbox_token.is_empty())
+    {
+        binds.push(format!(
+            "{}:{}:ro,z",
+            sandbox_token_host_path(sandbox, config)?.display(),
+            SANDBOX_TOKEN_MOUNT_PATH
+        ));
+    }
+    Ok(binds)
+}
+
+fn sandbox_token_host_path(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<PathBuf, Status> {
+    sandbox_token_host_path_by_id(&sandbox.id, config)
+}
+
+fn sandbox_token_host_path_by_id(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<PathBuf, Status> {
+    openshell_core::driver_utils::sandbox_token_path(
+        "docker-sandbox-tokens",
+        Some(&config.sandbox_namespace),
+        sandbox_id,
+    )
+    .map_err(|err| {
+        Status::internal(format!(
+            "resolve sandbox token state directory failed: {err}"
+        ))
+    })
+}
+
+async fn write_sandbox_token_file(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<bool, Status> {
+    let Some(spec) = sandbox.spec.as_ref() else {
+        return Ok(false);
+    };
+    if spec.sandbox_token.is_empty() {
+        return Ok(false);
+    }
+    let path = sandbox_token_host_path(sandbox, config)?;
+    if let Some(parent) = path.parent() {
+        openshell_core::paths::create_dir_restricted(parent).map_err(|err| {
+            Status::internal(format!(
+                "create sandbox token directory {} failed: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    tokio::fs::write(&path, format!("{}\n", spec.sandbox_token))
+        .await
+        .map_err(|err| {
+            Status::internal(format!(
+                "write sandbox token file {} failed: {err}",
+                path.display()
+            ))
+        })?;
+    openshell_core::paths::set_file_owner_only(&path).map_err(|err| {
+        Status::internal(format!(
+            "restrict sandbox token file {} failed: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(true)
+}
+
+fn cleanup_sandbox_token_file(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) {
+    cleanup_sandbox_token_file_by_id(&sandbox.id, config);
+}
+
+fn cleanup_sandbox_token_file_by_id(sandbox_id: &str, config: &DockerDriverRuntimeConfig) {
+    let Ok(path) = sandbox_token_host_path_by_id(sandbox_id, config) else {
+        return;
+    };
+    if let Err(err) = std::fs::remove_file(&path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            sandbox_id = %sandbox_id,
+            path = %path.display(),
+            error = %err,
+            "Failed to remove Docker sandbox token file"
+        );
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
 }
 
 fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) -> Vec<String> {
@@ -894,7 +1039,7 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         ("TERM".to_string(), "xterm".to_string()),
         (
             "OPENSHELL_LOG_LEVEL".to_string(),
-            sandbox_log_level(sandbox, &config.log_level),
+            openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level),
         ),
     ]);
 
@@ -906,17 +1051,23 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
     }
 
     environment.insert(
-        "OPENSHELL_ENDPOINT".to_string(),
+        openshell_core::sandbox_env::ENDPOINT.to_string(),
         config.grpc_endpoint.clone(),
     );
-    environment.insert("OPENSHELL_SANDBOX_ID".to_string(), sandbox.id.clone());
-    environment.insert("OPENSHELL_SANDBOX".to_string(), sandbox.name.clone());
     environment.insert(
-        "OPENSHELL_SSH_SOCKET_PATH".to_string(),
+        openshell_core::sandbox_env::SANDBOX_ID.to_string(),
+        sandbox.id.clone(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::SANDBOX.to_string(),
+        sandbox.name.clone(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
         config.ssh_socket_path.clone(),
     );
     environment.insert(
-        "OPENSHELL_SANDBOX_COMMAND".to_string(),
+        openshell_core::sandbox_env::SANDBOX_COMMAND.to_string(),
         SANDBOX_COMMAND.to_string(),
     );
     // The root supervisor executes namespace helpers during bootstrap; keep
@@ -924,16 +1075,30 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
     environment.insert("PATH".to_string(), SUPERVISOR_PATH.to_string());
     if config.guest_tls.is_some() {
         environment.insert(
-            "OPENSHELL_TLS_CA".to_string(),
+            openshell_core::sandbox_env::TLS_CA.to_string(),
             TLS_CA_MOUNT_PATH.to_string(),
         );
         environment.insert(
-            "OPENSHELL_TLS_CERT".to_string(),
+            openshell_core::sandbox_env::TLS_CERT.to_string(),
             TLS_CERT_MOUNT_PATH.to_string(),
         );
         environment.insert(
-            "OPENSHELL_TLS_KEY".to_string(),
+            openshell_core::sandbox_env::TLS_KEY.to_string(),
             TLS_KEY_MOUNT_PATH.to_string(),
+        );
+    }
+
+    environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
+    environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+
+    // Gateway-minted sandbox JWT. Keep the raw bearer out of container
+    // metadata; the supervisor reads it from this driver-owned bind mount.
+    if let Some(spec) = sandbox.spec.as_ref()
+        && !spec.sandbox_token.is_empty()
+    {
+        environment.insert(
+            openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.to_string(),
+            SANDBOX_TOKEN_MOUNT_PATH.to_string(),
         );
     }
 
@@ -970,17 +1135,17 @@ fn build_container_create_body(
     let resource_limits = docker_resource_limits(template)?;
     let mut labels = template.labels.clone();
     labels.insert(
-        MANAGED_BY_LABEL_KEY.to_string(),
-        MANAGED_BY_LABEL_VALUE.to_string(),
+        LABEL_MANAGED_BY.to_string(),
+        LABEL_MANAGED_BY_VALUE.to_string(),
     );
-    labels.insert(SANDBOX_ID_LABEL_KEY.to_string(), sandbox.id.clone());
-    labels.insert(SANDBOX_NAME_LABEL_KEY.to_string(), sandbox.name.clone());
+    labels.insert(LABEL_SANDBOX_ID.to_string(), sandbox.id.clone());
+    labels.insert(LABEL_SANDBOX_NAME.to_string(), sandbox.name.clone());
     // The list/get/find paths filter by `config.sandbox_namespace`, so use
     // the same value here. `DriverSandbox.namespace` is unset on the request
     // path (the gateway elides it), and using it would produce containers
     // that the driver itself cannot find afterwards.
     labels.insert(
-        SANDBOX_NAMESPACE_LABEL_KEY.to_string(),
+        LABEL_SANDBOX_NAMESPACE.to_string(),
         config.sandbox_namespace.clone(),
     );
 
@@ -997,7 +1162,7 @@ fn build_container_create_body(
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
             device_requests: docker_gpu_device_requests(spec.gpu, &spec.gpu_device),
-            binds: Some(build_binds(config)),
+            binds: Some(build_binds(sandbox, config)?),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,
@@ -1047,16 +1212,6 @@ fn require_sandbox_identifier(sandbox_id: &str, sandbox_name: &str) -> Result<()
     Ok(())
 }
 
-fn sandbox_log_level(sandbox: &DriverSandbox, default_level: &str) -> String {
-    sandbox
-        .spec
-        .as_ref()
-        .map(|spec| spec.log_level.as_str())
-        .filter(|level| !level.is_empty())
-        .unwrap_or(default_level)
-        .to_string()
-}
-
 fn docker_container_openshell_endpoint(endpoint: &str, host: &str, port: u16) -> String {
     let Ok(mut url) = Url::parse(endpoint) else {
         return endpoint.to_string();
@@ -1083,11 +1238,10 @@ fn parse_optional_host_gateway_ip(value: &str) -> CoreResult<Option<IpAddr>> {
         return Ok(None);
     }
 
-    trimmed.parse().map(Some).map_err(|err| {
-        Error::config(format!(
-            "invalid OPENSHELL_HOST_GATEWAY_IP value '{trimmed}': {err}"
-        ))
-    })
+    trimmed
+        .parse()
+        .map(Some)
+        .map_err(|err| Error::config(format!("invalid host_gateway_ip value '{trimmed}': {err}")))
 }
 
 fn docker_gateway_route(
@@ -1096,6 +1250,22 @@ fn docker_gateway_route(
     port: u16,
     host_gateway_ip: Option<IpAddr>,
 ) -> DockerGatewayRoute {
+    docker_gateway_route_for_host(
+        info,
+        bridge_gateway_ip,
+        port,
+        host_gateway_ip,
+        host_runtime_requires_host_gateway_alias(),
+    )
+}
+
+fn docker_gateway_route_for_host(
+    info: &SystemInfo,
+    bridge_gateway_ip: IpAddr,
+    port: u16,
+    host_gateway_ip: Option<IpAddr>,
+    host_requires_host_gateway_alias: bool,
+) -> DockerGatewayRoute {
     if let Some(host_alias_ip) = host_gateway_ip {
         return DockerGatewayRoute::Bridge {
             bind_address: SocketAddr::new(host_alias_ip, port),
@@ -1103,7 +1273,7 @@ fn docker_gateway_route(
         };
     }
 
-    if uses_host_gateway_alias(info) {
+    if host_requires_host_gateway_alias || uses_host_gateway_alias(info) {
         DockerGatewayRoute::HostGateway
     } else {
         DockerGatewayRoute::Bridge {
@@ -1111,6 +1281,10 @@ fn docker_gateway_route(
             host_alias_ip: bridge_gateway_ip,
         }
     }
+}
+
+fn host_runtime_requires_host_gateway_alias() -> bool {
+    cfg!(target_os = "macos")
 }
 
 /// Detect Docker Desktop and behaviourally compatible runtimes - Colima,
@@ -1183,8 +1357,8 @@ async fn ensure_bridge_network(docker: &Docker, network_name: &str) -> CoreResul
             driver: Some(DOCKER_NETWORK_DRIVER.to_string()),
             attachable: Some(true),
             labels: Some(HashMap::from([(
-                MANAGED_BY_LABEL_KEY.to_string(),
-                MANAGED_BY_LABEL_VALUE.to_string(),
+                LABEL_MANAGED_BY.to_string(),
+                LABEL_MANAGED_BY_VALUE.to_string(),
             )])),
             ..Default::default()
         })
@@ -1363,10 +1537,10 @@ fn sandbox_from_container_summary(
     readiness: &dyn SupervisorReadiness,
 ) -> Option<DriverSandbox> {
     let labels = summary.labels.as_ref()?;
-    let id = labels.get(SANDBOX_ID_LABEL_KEY)?.clone();
-    let name = labels.get(SANDBOX_NAME_LABEL_KEY)?.clone();
+    let id = labels.get(LABEL_SANDBOX_ID)?.clone();
+    let name = labels.get(LABEL_SANDBOX_NAME)?.clone();
     let namespace = labels
-        .get(SANDBOX_NAMESPACE_LABEL_KEY)
+        .get(LABEL_SANDBOX_NAMESPACE)
         .cloned()
         .unwrap_or_default();
 
@@ -1539,8 +1713,8 @@ fn managed_container_label_filters(
     extra_values: impl IntoIterator<Item = String>,
 ) -> HashMap<String, Vec<String>> {
     let mut values = vec![
-        format!("{MANAGED_BY_LABEL_KEY}={MANAGED_BY_LABEL_VALUE}"),
-        format!("{SANDBOX_NAMESPACE_LABEL_KEY}={sandbox_namespace}"),
+        format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}"),
+        format!("{LABEL_SANDBOX_NAMESPACE}={sandbox_namespace}"),
     ];
     values.extend(extra_values);
     label_filters(values)
@@ -1626,7 +1800,7 @@ pub(crate) async fn resolve_supervisor_bin(
     docker_config: &DockerComputeConfig,
     daemon_arch: &str,
 ) -> CoreResult<PathBuf> {
-    // Tier 1: explicit --docker-supervisor-bin / OPENSHELL_DOCKER_SUPERVISOR_BIN.
+    // Tier 1: explicit supervisor_bin in [openshell.drivers.docker].
     if let Some(path) = docker_config.supervisor_bin.clone() {
         let path = canonicalize_existing_file(&path, "docker supervisor binary")?;
         validate_linux_elf_binary(&path)?;
@@ -1693,10 +1867,27 @@ fn linux_supervisor_candidates(daemon_arch: &str) -> Vec<PathBuf> {
 /// inside the digest-keyed directory and renamed into place, so concurrent
 /// gateway starts don't observe a partial file.
 async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> CoreResult<PathBuf> {
+    let refresh_attempted = if supervisor_image_should_refresh(image) {
+        info!(image = image, "Refreshing mutable docker supervisor image");
+        match pull_supervisor_image(docker, image).await {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(
+                    image = image,
+                    error = %err,
+                    "failed to refresh mutable docker supervisor image; falling back to local image if present",
+                );
+                true
+            }
+        }
+    } else {
+        false
+    };
+
     // Inspect first to see if the image is already present; only pull on miss.
     let inspect = match docker.inspect_image(image).await {
         Ok(inspect) => inspect,
-        Err(err) if is_not_found_error(&err) => {
+        Err(err) if is_not_found_error(&err) && !refresh_attempted => {
             info!(image = image, "Pulling docker supervisor image");
             pull_supervisor_image(docker, image).await?;
             docker.inspect_image(image).await.map_err(|err| {
@@ -1704,6 +1895,11 @@ async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> Core
                     "failed to inspect docker supervisor image '{image}' after pull: {err}",
                 ))
             })?
+        }
+        Err(err) if is_not_found_error(&err) => {
+            return Err(Error::config(format!(
+                "docker supervisor image '{image}' is not present locally after refresh attempt",
+            )));
         }
         Err(err) => {
             return Err(Error::config(format!(
@@ -1748,6 +1944,23 @@ async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> Core
     write_cache_binary_atomic(&cache_path, &binary_bytes)?;
     validate_linux_elf_binary(&cache_path)?;
     Ok(cache_path)
+}
+
+fn supervisor_image_should_refresh(image: &str) -> bool {
+    matches!(supervisor_image_tag(image), Some("dev" | "latest"))
+}
+
+fn supervisor_image_tag(image: &str) -> Option<&str> {
+    if image.contains('@') {
+        return None;
+    }
+
+    let image_name = image.rsplit('/').next().unwrap_or(image);
+    image_name
+        .rsplit_once(':')
+        .map_or(Some("latest"), |(_, tag)| {
+            if tag.is_empty() { None } else { Some(tag) }
+        })
 }
 
 async fn pull_supervisor_image(docker: &Docker, image: &str) -> CoreResult<()> {
@@ -1969,19 +2182,24 @@ pub(crate) fn validate_linux_elf_binary(path: &Path) -> CoreResult<()> {
     Ok(())
 }
 
+fn docker_guest_tls_configured(docker_config: &DockerComputeConfig) -> bool {
+    docker_config.guest_tls_ca.is_some()
+        && docker_config.guest_tls_cert.is_some()
+        && docker_config.guest_tls_key.is_some()
+}
+
 pub(crate) fn docker_guest_tls_paths(
-    config: &Config,
     docker_config: &DockerComputeConfig,
 ) -> CoreResult<Option<DockerGuestTlsPaths>> {
     let tls_flags_provided = docker_config.guest_tls_ca.is_some()
         || docker_config.guest_tls_cert.is_some()
         || docker_config.guest_tls_key.is_some();
 
-    if !config.grpc_endpoint.starts_with("https://") {
+    if !docker_config.grpc_endpoint.starts_with("https://") {
         if tls_flags_provided {
             return Err(Error::config(format!(
-                "--docker-tls-ca/--docker-tls-cert/--docker-tls-key were provided but OPENSHELL_GRPC_ENDPOINT is '{}'; TLS materials require an https:// endpoint",
-                config.grpc_endpoint,
+                "guest_tls_ca/guest_tls_cert/guest_tls_key were provided but grpc_endpoint is '{}'; TLS materials require an https:// endpoint",
+                docker_config.grpc_endpoint,
             )));
         }
         return Ok(None);
@@ -1994,23 +2212,23 @@ pub(crate) fn docker_guest_tls_paths(
     ];
     if provided.iter().all(Option::is_none) {
         return Err(Error::config(
-            "docker compute driver requires --docker-tls-ca, --docker-tls-cert, and --docker-tls-key when OPENSHELL_GRPC_ENDPOINT uses https://",
+            "docker compute driver requires guest_tls_ca, guest_tls_cert, and guest_tls_key when grpc_endpoint uses https://",
         ));
     }
 
     let Some(ca) = docker_config.guest_tls_ca.clone() else {
         return Err(Error::config(
-            "--docker-tls-ca is required when Docker sandbox TLS materials are configured",
+            "guest_tls_ca is required when Docker sandbox TLS materials are configured",
         ));
     };
     let Some(cert) = docker_config.guest_tls_cert.clone() else {
         return Err(Error::config(
-            "--docker-tls-cert is required when Docker sandbox TLS materials are configured",
+            "guest_tls_cert is required when Docker sandbox TLS materials are configured",
         ));
     };
     let Some(key) = docker_config.guest_tls_key.clone() else {
         return Err(Error::config(
-            "--docker-tls-key is required when Docker sandbox TLS materials are configured",
+            "guest_tls_key is required when Docker sandbox TLS materials are configured",
         ));
     };
 

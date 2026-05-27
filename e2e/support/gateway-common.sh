@@ -34,6 +34,54 @@ e2e_pick_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
 }
 
+e2e_generate_pki() {
+  local gateway_bin=$1
+  local pki_dir=$2
+  shift 2
+  # Remaining args are extra --server-san values (e.g. host.containers.internal).
+  # host.docker.internal and localhost are already in the default SAN list.
+
+  local san_args=()
+  san_args+=(--server-san host.openshell.internal)
+  for san in "$@"; do
+    san_args+=(--server-san "${san}")
+  done
+
+  "${gateway_bin}" generate-certs --output-dir "${pki_dir}" "${san_args[@]}"
+}
+
+e2e_preserve_mise_dirs() {
+  if ! command -v mise >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [ -z "${MISE_DATA_DIR:-}" ]; then
+    export MISE_DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/mise"
+  fi
+
+  if [ -z "${MISE_CACHE_DIR:-}" ]; then
+    case "$(uname -s)" in
+      Darwin) export MISE_CACHE_DIR="${HOME}/Library/Caches/mise" ;;
+      *) export MISE_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/mise" ;;
+    esac
+  fi
+}
+
+e2e_align_docker_host_with_cli_context() {
+  if [ -n "${DOCKER_HOST:-}" ] || ! command -v docker >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local endpoint
+  endpoint="$(docker context inspect --format '{{ .Endpoints.docker.Host }}' 2>/dev/null || true)"
+  if [ -z "${endpoint}" ] || [ "${endpoint}" = "<no value>" ]; then
+    return 0
+  fi
+
+  export DOCKER_HOST="${endpoint}"
+  echo "Using Docker endpoint from active context: ${DOCKER_HOST}"
+}
+
 e2e_register_plaintext_gateway() {
   local config_home=$1
   local name=$2
@@ -63,9 +111,9 @@ e2e_register_mtls_gateway() {
   local gateway_config_dir="${config_home}/openshell/gateways/${name}"
 
   mkdir -p "${gateway_config_dir}/mtls"
-  cp "${pki_dir}/ca.crt"     "${gateway_config_dir}/mtls/ca.crt"
-  cp "${pki_dir}/client.crt" "${gateway_config_dir}/mtls/tls.crt"
-  cp "${pki_dir}/client.key" "${gateway_config_dir}/mtls/tls.key"
+  cp "${pki_dir}/ca.crt"         "${gateway_config_dir}/mtls/ca.crt"
+  cp "${pki_dir}/client/tls.crt" "${gateway_config_dir}/mtls/tls.crt"
+  cp "${pki_dir}/client/tls.key" "${gateway_config_dir}/mtls/tls.key"
   cat >"${gateway_config_dir}/metadata.json" <<EOF
 {
   "name": "${name}",
@@ -75,6 +123,42 @@ e2e_register_mtls_gateway() {
 }
 EOF
   printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
+}
+
+e2e_toml_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "${value}"
+}
+
+e2e_generate_gateway_jwt() {
+  local jwt_dir=$1
+
+  mkdir -p "${jwt_dir}"
+  (
+    umask 077
+    openssl genpkey -algorithm Ed25519 -out "${jwt_dir}/signing.pem" >/dev/null 2>&1
+  )
+  openssl pkey -in "${jwt_dir}/signing.pem" -pubout -out "${jwt_dir}/public.pem" >/dev/null 2>&1
+  openssl rand -hex 16 >"${jwt_dir}/kid"
+}
+
+e2e_write_gateway_jwt_config() {
+  local jwt_dir=$1
+  local gateway_id=$2
+
+  printf '[openshell.gateway.gateway_jwt]\n'
+  printf 'signing_key_path = %s\n' "$(e2e_toml_string "${jwt_dir}/signing.pem")"
+  printf 'public_key_path = %s\n'  "$(e2e_toml_string "${jwt_dir}/public.pem")"
+  printf 'kid_path = %s\n'         "$(e2e_toml_string "${jwt_dir}/kid")"
+  printf 'gateway_id = %s\n'       "$(e2e_toml_string "${gateway_id}")"
+  printf 'ttl_secs = 3600\n\n'
+}
+
+e2e_write_gateway_mtls_auth_config() {
+  printf '[openshell.gateway.mtls_auth]\n'
+  printf 'enabled = true\n\n'
 }
 
 e2e_build_gateway_binaries() {
@@ -160,4 +244,3 @@ e2e_print_gateway_log_on_failure() {
     echo "=== end gateway log ==="
   fi
 }
-

@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod helpers;
+
+use helpers::{
+    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
+};
 use openshell_bootstrap::load_last_sandbox;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
@@ -10,23 +15,23 @@ use openshell_core::proto::{
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
     DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
-    ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest, GetGatewayConfigResponse,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, PlatformEvent, ProviderResponse, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, Sandbox, SandboxPhase, SandboxResponse, SandboxStreamEvent,
-    ServiceStatus, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
-    sandbox_stream_event,
-};
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
+    ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, PlatformEvent,
+    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox, SandboxCondition,
+    SandboxLogLine, SandboxPhase, SandboxResponse, SandboxStatus, SandboxStreamEvent,
+    ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
+    sandbox_stream_event, setting_value,
 };
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
@@ -34,56 +39,14 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
 use tonic::{Response, Status};
 
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct SavedVar {
-    key: &'static str,
-    original: Option<String>,
-}
-
-struct EnvVarGuard {
-    vars: Vec<SavedVar>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-#[allow(unsafe_code)]
-impl EnvVarGuard {
-    fn set(pairs: &[(&'static str, String)]) -> Self {
-        let lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut vars = Vec::with_capacity(pairs.len());
-        for (key, value) in pairs {
-            let original = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            vars.push(SavedVar { key, original });
-        }
-        Self { vars, _lock: lock }
-    }
-}
-
-#[allow(unsafe_code)]
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        for var in &self.vars {
-            if let Some(value) = &var.original {
-                unsafe {
-                    std::env::set_var(var.key, value);
-                }
-            } else {
-                unsafe {
-                    std::env::remove_var(var.key);
-                }
-            }
-        }
-    }
-}
-
 #[derive(Clone, Default)]
 struct SandboxState {
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
+    create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
+    vm_error_after_started: Arc<AtomicBool>,
+    vm_slow_progress_before_ready: Arc<AtomicBool>,
+    vm_log_churn_before_ready: Arc<AtomicBool>,
+    global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
 }
 
 #[derive(Clone, Default)]
@@ -107,7 +70,9 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        let name = request.into_inner().name;
+        let request = request.into_inner();
+        let name = request.name.clone();
+        self.state.create_requests.lock().await.push(request);
         let sandbox_name = if name.is_empty() {
             "test-sandbox".to_string()
         } else {
@@ -121,6 +86,7 @@ impl OpenShell for TestOpenShell {
                     name: sandbox_name,
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 phase: SandboxPhase::Provisioning as i32,
                 ..Sandbox::default()
@@ -140,6 +106,7 @@ impl OpenShell for TestOpenShell {
                     name,
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 phase: SandboxPhase::Ready as i32,
                 ..Sandbox::default()
@@ -199,7 +166,10 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<GetGatewayConfigRequest>,
     ) -> Result<Response<GetGatewayConfigResponse>, Status> {
-        Ok(Response::new(GetGatewayConfigResponse::default()))
+        Ok(Response::new(GetGatewayConfigResponse {
+            settings: self.state.global_settings.lock().await.clone(),
+            settings_revision: 1,
+        }))
     }
 
     async fn get_sandbox_provider_environment(
@@ -325,6 +295,33 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<ProviderResponse>, Status> {
         Ok(Response::new(ProviderResponse::default()))
     }
+    async fn get_provider_refresh_status(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderRefreshStatusResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn configure_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::ConfigureProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn rotate_provider_credential(
+        &self,
+        _: tonic::Request<openshell_core::proto::RotateProviderCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::RotateProviderCredentialResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
 
     async fn delete_provider(
         &self,
@@ -346,6 +343,12 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::WatchSandboxStream>, Status> {
         let sandbox_id = request.into_inner().id;
         let (tx, rx) = mpsc::channel(4);
+        let vm_error_after_started = self.state.vm_error_after_started.load(Ordering::SeqCst);
+        let vm_slow_progress_before_ready = self
+            .state
+            .vm_slow_progress_before_ready
+            .load(Ordering::SeqCst);
+        let vm_log_churn_before_ready = self.state.vm_log_churn_before_ready.load(Ordering::SeqCst);
 
         tokio::spawn(async move {
             let provisioning = Sandbox {
@@ -354,9 +357,27 @@ impl OpenShell for TestOpenShell {
                     name: sandbox_id.trim_start_matches("id-").to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 phase: SandboxPhase::Provisioning as i32,
                 ..Sandbox::default()
+            };
+            let error = Sandbox {
+                phase: SandboxPhase::Error as i32,
+                status: Some(SandboxStatus {
+                    sandbox_name: sandbox_id.trim_start_matches("id-").to_string(),
+                    agent_pod: String::new(),
+                    agent_fd: String::new(),
+                    sandbox_fd: String::new(),
+                    conditions: vec![SandboxCondition {
+                        r#type: "Ready".to_string(),
+                        status: "False".to_string(),
+                        reason: "ProcessExited".to_string(),
+                        message: "VM process exited with status 0".to_string(),
+                        last_transition_time: String::new(),
+                    }],
+                }),
+                ..provisioning.clone()
             };
             let ready = Sandbox {
                 phase: SandboxPhase::Ready as i32,
@@ -368,6 +389,80 @@ impl OpenShell for TestOpenShell {
                     payload: Some(sandbox_stream_event::Payload::Sandbox(provisioning)),
                 }))
                 .await;
+            if vm_error_after_started {
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Event(PlatformEvent {
+                            source: "vm".to_string(),
+                            reason: "Started".to_string(),
+                            message: "Started VM launcher".to_string(),
+                            ..PlatformEvent::default()
+                        })),
+                    }))
+                    .await;
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(error)),
+                    }))
+                    .await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                return;
+            }
+            if vm_log_churn_before_ready {
+                for message in ["still booting", "still booting again"] {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    let _ = tx
+                        .send(Ok(SandboxStreamEvent {
+                            payload: Some(sandbox_stream_event::Payload::Log(SandboxLogLine {
+                                sandbox_id: sandbox_id.clone(),
+                                timestamp_ms: 0,
+                                level: "INFO".to_string(),
+                                target: "test".to_string(),
+                                message: message.to_string(),
+                                source: "gateway".to_string(),
+                                fields: HashMap::new(),
+                            })),
+                        }))
+                        .await;
+                }
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                    }))
+                    .await;
+                return;
+            }
+            if vm_slow_progress_before_ready {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Event(PlatformEvent {
+                            source: "vm".to_string(),
+                            reason: "PreparingRootfs".to_string(),
+                            message: "Preparing rootfs".to_string(),
+                            ..PlatformEvent::default()
+                        })),
+                    }))
+                    .await;
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Event(PlatformEvent {
+                            source: "vm".to_string(),
+                            reason: "CreatingRootDisk".to_string(),
+                            message: "Formatting root disk".to_string(),
+                            ..PlatformEvent::default()
+                        })),
+                    }))
+                    .await;
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                    }))
+                    .await;
+                return;
+            }
             let _ = tx
                 .send(Ok(SandboxStreamEvent {
                     payload: Some(sandbox_stream_event::Payload::Event(PlatformEvent {
@@ -397,6 +492,15 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+
+    type ExecSandboxInteractiveStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    async fn exec_sandbox_interactive(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn update_config(
@@ -504,6 +608,20 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn issue_sandbox_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::IssueSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn refresh_sandbox_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RefreshSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::RefreshSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn connect_supervisor(
         &self,
         _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
@@ -531,34 +649,6 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::ForwardTcpStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
-}
-
-fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-fn build_ca() -> (Certificate, KeyPair) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let cert = params.self_signed(&key_pair).unwrap();
-    (cert, key_pair)
-}
-
-fn build_server_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    (cert.pem(), key_pair.serialize_pem())
-}
-
-fn build_client_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    (cert.pem(), key_pair.serialize_pem())
 }
 
 struct TestServer {
@@ -628,24 +718,50 @@ fn install_fake_ssh(dir: &TempDir) -> std::path::PathBuf {
 }
 
 fn test_env(fake_ssh_dir: &TempDir, xdg_dir: &TempDir) -> EnvVarGuard {
+    test_env_with(fake_ssh_dir, xdg_dir, &[])
+}
+
+fn test_env_with(
+    fake_ssh_dir: &TempDir,
+    xdg_dir: &TempDir,
+    extra: &[(&'static str, String)],
+) -> EnvVarGuard {
     let path = format!(
         "{}:{}",
         fake_ssh_dir.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    let xdg = xdg_dir.path().to_str().unwrap().to_string();
 
-    EnvVarGuard::set(&[
+    let mut owned_pairs = vec![
         ("PATH", path),
-        (
-            "XDG_CONFIG_HOME",
-            xdg_dir.path().to_str().unwrap().to_string(),
-        ),
-        ("HOME", xdg_dir.path().to_str().unwrap().to_string()),
-    ])
+        ("XDG_CONFIG_HOME", xdg.clone()),
+        ("HOME", xdg),
+    ];
+    owned_pairs.extend(extra.iter().cloned());
+    let pairs = owned_pairs
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect::<Vec<_>>();
+
+    EnvVarGuard::set(&pairs)
 }
 
 async fn deleted_names(server: &TestServer) -> Vec<Vec<String>> {
     server.openshell.state.deleted_names.lock().await.clone()
+}
+
+async fn create_requests(server: &TestServer) -> Vec<CreateSandboxRequest> {
+    server.openshell.state.create_requests.lock().await.clone()
+}
+
+async fn enable_providers_v2(server: &TestServer) {
+    server.openshell.state.global_settings.lock().await.insert(
+        openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+        SettingValue {
+            value: Some(setting_value::Value::BoolValue(true)),
+        },
+    );
 }
 
 fn test_tls(server: &TestServer) -> TlsOptions {
@@ -671,6 +787,8 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         false,
         None,
         None,
+        None,
+        None,
         &[],
         None,
         None,
@@ -692,6 +810,274 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
 }
 
 #[tokio::test]
+async fn sandbox_create_sends_cpu_and_memory_limits_only() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        Some("resources"),
+        None,
+        "openshell",
+        None,
+        true,
+        false,
+        None,
+        Some("500m"),
+        Some("2Gi"),
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    let resources = requests[0]
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .and_then(|template| template.resources.as_ref())
+        .expect("resource limits should be sent");
+    let limits = resources
+        .fields
+        .get("limits")
+        .and_then(|value| value.kind.as_ref())
+        .and_then(|kind| match kind {
+            prost_types::value::Kind::StructValue(inner) => Some(inner),
+            _ => None,
+        })
+        .expect("limits should be a struct");
+
+    assert_eq!(
+        limits
+            .fields
+            .get("cpu")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                _ => None,
+            }),
+        Some("500m")
+    );
+    assert_eq!(
+        limits
+            .fields
+            .get("memory")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                _ => None,
+            }),
+        Some("2Gi")
+    );
+    assert!(!resources.fields.contains_key("requests"));
+}
+
+#[tokio::test]
+async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
+    let server = run_server().await;
+    enable_providers_v2(&server).await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        Some("v2-no-inferred-provider"),
+        None,
+        "openshell",
+        None,
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["claude".to_string(), "--version".to_string()],
+        Some(true),
+        Some(false),
+        &HashMap::new(),
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed without inferred provider");
+
+    let requests = create_requests(&server).await;
+    let providers = requests[0]
+        .spec
+        .as_ref()
+        .expect("sandbox spec should be sent")
+        .providers
+        .clone();
+    assert!(
+        providers.is_empty(),
+        "providers v2 should not infer command providers, got {providers:?}"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .vm_error_after_started
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env_with(
+        &fake_ssh_dir,
+        &xdg_dir,
+        &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
+    );
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let started_at = Instant::now();
+    let err = run::sandbox_create(
+        &server.endpoint,
+        Some("vm-error"),
+        None,
+        "openshell",
+        None,
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        &tls,
+    )
+    .await
+    .expect_err("sandbox create should fail on terminal VM error");
+
+    assert!(
+        started_at.elapsed() < Duration::from_secs(2),
+        "terminal VM errors should not wait for the provisioning timeout"
+    );
+    let rendered = err.to_string();
+    assert!(rendered.contains("sandbox entered error phase while provisioning"));
+    assert!(rendered.contains("ProcessExited: VM process exited with status 0"));
+    assert!(!rendered.contains("timed out"));
+}
+
+#[tokio::test]
+async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .vm_slow_progress_before_ready
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env_with(
+        &fake_ssh_dir,
+        &xdg_dir,
+        &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
+    );
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        Some("vm-slow-progress"),
+        None,
+        "openshell",
+        None,
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        &tls,
+    )
+    .await
+    .expect("sandbox create should not time out while VM progress is active");
+}
+
+#[tokio::test]
+async fn sandbox_create_times_out_when_only_logs_arrive() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .vm_log_churn_before_ready
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env_with(
+        &fake_ssh_dir,
+        &xdg_dir,
+        &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
+    );
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let started_at = Instant::now();
+    let err = run::sandbox_create(
+        &server.endpoint,
+        Some("vm-log-churn"),
+        None,
+        "openshell",
+        None,
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        &tls,
+    )
+    .await
+    .expect_err("sandbox create should time out when only logs arrive");
+
+    assert!(
+        started_at.elapsed() < Duration::from_secs(2),
+        "logs should not extend the provisioning timeout"
+    );
+    assert!(err.to_string().contains("sandbox provisioning timed out"));
+}
+
+#[tokio::test]
 async fn sandbox_create_deletes_command_sessions_with_no_keep() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
@@ -708,6 +1094,8 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         None,
         false,
         false,
+        None,
+        None,
         None,
         None,
         &[],
@@ -752,6 +1140,8 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         false,
         None,
         None,
+        None,
+        None,
         &[],
         None,
         None,
@@ -794,6 +1184,8 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         false,
         None,
         None,
+        None,
+        None,
         &[],
         None,
         None,
@@ -834,6 +1226,8 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         None,
         false,
         false,
+        None,
+        None,
         None,
         None,
         &[],

@@ -5,7 +5,12 @@
 
 [test]
 description = "Run all tests (Rust + Python)"
-depends = ["test:rust", "test:python"]
+depends = ["test:rust", "test:python", "test:install-sh"]
+
+["test:install-sh"]
+description = "Run focused install.sh shell tests"
+run = "tasks/scripts/test-install-sh.sh"
+hide = true
 
 [e2e]
 description = "Run all end-to-end tests (Rust + Python)"
@@ -67,7 +72,7 @@ env = { OPENSHELL_E2E_PODMAN_GPU = "1", OPENSHELL_E2E_PODMAN_TEST = "gpu_device_
 run = "e2e/rust/e2e-podman.sh"
 
 ["e2e:kubernetes"]
-description = "Run Rust CLI e2e tests against an OpenShell gateway deployed on Kubernetes via Helm (set OPENSHELL_E2E_KUBE_CONTEXT to reuse a cluster, otherwise creates a local k3d cluster; set OPENSHELL_E2E_KUBE_TEST=<name> to scope to one test)"
+description = "Run Rust CLI e2e tests against an OpenShell gateway deployed on Kubernetes via Helm (set OPENSHELL_E2E_KUBE_CONTEXT to reuse a cluster; otherwise creates a local k3d cluster when k3d is installed; set OPENSHELL_E2E_KUBE_TEST=<name> to scope to one test)"
 run = "e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:vm"]
@@ -77,6 +82,13 @@ run = "e2e/rust/e2e-vm.sh"
 ["e2e:docker"]
 description = "Run smoke e2e against a standalone gateway with the Docker compute driver"
 run = "e2e/rust/e2e-docker.sh"
+
+["e2e:mechanistic-smoke"]
+description = "Run mechanistic L4 smoke against a Docker-backed gateway"
+run = [
+  "cargo build -p openshell-cli --features openshell-core/dev-settings",
+  "e2e/with-docker-gateway.sh bash -lc 'target/debug/openshell settings set --global --key agent_policy_proposals_enabled --value true --yes && OPENSHELL_BIN=$PWD/target/debug/openshell bash e2e/policy-advisor/mechanistic-smoke.sh'",
+]
 
 ["e2e:docker:gpu"]
 description = "Run GPU e2e against a standalone gateway with the Docker compute driver"

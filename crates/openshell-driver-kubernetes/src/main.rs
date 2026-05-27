@@ -10,8 +10,8 @@ use tracing_subscriber::EnvFilter;
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
-    ComputeDriverService, KubernetesComputeConfig, KubernetesComputeDriver,
-    SupervisorSideloadMethod,
+    ComputeDriverService, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig,
+    KubernetesComputeDriver, SupervisorSideloadMethod,
 };
 
 #[derive(Parser, Debug)]
@@ -31,6 +31,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_NAMESPACE", default_value = "default")]
     sandbox_namespace: String,
 
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_SANDBOX_SERVICE_ACCOUNT",
+        default_value = DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME
+    )]
+    sandbox_service_account: String,
+
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE")]
     sandbox_image: Option<String>,
 
@@ -46,12 +53,6 @@ struct Args {
         default_value = "/run/openshell/ssh.sock"
     )]
     sandbox_ssh_socket_path: String,
-
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
-    ssh_handshake_secret: String,
-
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS", default_value_t = 300)]
-    ssh_handshake_skew_secs: u64,
 
     #[arg(long, env = "OPENSHELL_CLIENT_TLS_SECRET_NAME")]
     client_tls_secret_name: Option<String>,
@@ -74,6 +75,13 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
+
+    /// Lifetime (seconds) of the projected `ServiceAccount` token
+    /// kubelet writes into each sandbox pod for the `IssueSandboxToken`
+    /// bootstrap exchange. Kubelet enforces a minimum of 600s; the
+    /// gateway clamps values outside `[600, 86400]`. Default 3600.
+    #[arg(long, env = "OPENSHELL_K8S_SA_TOKEN_TTL_SECS", default_value_t = 3600)]
+    sa_token_ttl_secs: i64,
 }
 
 #[tokio::main]
@@ -87,6 +95,7 @@ async fn main() -> Result<()> {
 
     let driver = KubernetesComputeDriver::new(KubernetesComputeConfig {
         namespace: args.sandbox_namespace,
+        service_account_name: args.sandbox_service_account,
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
         supervisor_image: args
@@ -96,11 +105,16 @@ async fn main() -> Result<()> {
         supervisor_sideload_method: args.supervisor_sideload_method,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         ssh_socket_path: args.sandbox_ssh_socket_path,
-        ssh_handshake_secret: args.ssh_handshake_secret,
-        ssh_handshake_skew_secs: args.ssh_handshake_skew_secs,
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
         host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
         enable_user_namespaces: args.enable_user_namespaces,
+        workspace_default_storage_size: std::env::var(
+            "OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE",
+        )
+        .unwrap_or_else(|_| {
+            openshell_driver_kubernetes::DEFAULT_WORKSPACE_STORAGE_SIZE.to_string()
+        }),
+        sa_token_ttl_secs: args.sa_token_ttl_secs,
     })
     .await
     .into_diagnostic()?;

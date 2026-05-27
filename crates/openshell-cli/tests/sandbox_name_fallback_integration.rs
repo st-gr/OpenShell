@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod helpers;
+
+use helpers::{
+    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
+};
 use openshell_bootstrap::{load_last_sandbox, save_last_sandbox};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
@@ -10,17 +15,15 @@ use openshell_core::proto::{
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
     DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
-    ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest, GetGatewayConfigResponse,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
+    ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, ProviderResponse, Sandbox, SandboxPolicy, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
-    WatchSandboxRequest,
-};
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    ListSandboxesResponse, NetworkEndpoint, NetworkPolicyRule, PolicyStatus, ProviderResponse,
+    Sandbox, SandboxPolicy, SandboxPolicyRevision, SandboxResponse, SandboxStreamEvent,
+    ServiceStatus, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
 };
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -29,50 +32,6 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
 use tonic::{Response, Status};
-
-// Serialise tests that mutate XDG_CONFIG_HOME so concurrent threads
-// don't clobber each other's environment.
-static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct EnvVarGuard {
-    key: &'static str,
-    original: Option<String>,
-    _xdg_lock: std::sync::MutexGuard<'static, ()>,
-}
-
-#[allow(unsafe_code)]
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let lock = XDG_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self {
-            key,
-            original,
-            _xdg_lock: lock,
-        }
-    }
-}
-
-#[allow(unsafe_code)]
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        if let Some(value) = &self.original {
-            unsafe {
-                std::env::set_var(self.key, value);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(self.key);
-            }
-        }
-        // _xdg_lock drops here, releasing the mutex
-    }
-}
 
 // ── mock OpenShell server ─────────────────────────────────────────────
 
@@ -119,6 +78,7 @@ impl OpenShell for TestOpenShell {
                     name,
                     created_at_ms: 0,
                     labels: std::collections::HashMap::new(),
+                    resource_version: 0,
                 }),
                 ..Default::default()
             }),
@@ -302,6 +262,33 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<ProviderResponse>, Status> {
         Ok(Response::new(ProviderResponse::default()))
     }
+    async fn get_provider_refresh_status(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderRefreshStatusResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn configure_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::ConfigureProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn rotate_provider_credential(
+        &self,
+        _: tonic::Request<openshell_core::proto::RotateProviderCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::RotateProviderCredentialResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
 
     async fn delete_provider(
         &self,
@@ -337,6 +324,15 @@ impl OpenShell for TestOpenShell {
         )))
     }
 
+    type ExecSandboxInteractiveStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    async fn exec_sandbox_interactive(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn update_config(
         &self,
         _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
@@ -346,9 +342,46 @@ impl OpenShell for TestOpenShell {
 
     async fn get_sandbox_policy_status(
         &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxPolicyStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxPolicyStatusResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
+        request: tonic::Request<GetSandboxPolicyStatusRequest>,
+    ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
+        let req = request.into_inner();
+        assert_eq!(req.name, "my-sandbox");
+        assert_eq!(req.version, 0);
+        assert!(!req.global);
+
+        let policy = SandboxPolicy {
+            version: 7,
+            network_policies: std::iter::once((
+                "api".to_string(),
+                NetworkPolicyRule {
+                    name: "api".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        protocol: "rest".to_string(),
+                        enforcement: "enforce".to_string(),
+                        access: "read-only".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        };
+
+        Ok(Response::new(GetSandboxPolicyStatusResponse {
+            revision: Some(SandboxPolicyRevision {
+                version: 7,
+                policy_hash: "sha256:test-policy".to_string(),
+                status: PolicyStatus::Loaded.into(),
+                created_at_ms: 1_700_000_000_000,
+                loaded_at_ms: 1_700_000_000_500,
+                policy: Some(policy),
+                ..Default::default()
+            }),
+            active_version: 7,
+        }))
     }
 
     async fn list_sandbox_policies(
@@ -442,6 +475,20 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn issue_sandbox_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::IssueSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn refresh_sandbox_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RefreshSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::RefreshSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn connect_supervisor(
         &self,
         _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
@@ -469,36 +516,6 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::ForwardTcpStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
-}
-
-// ── helpers ───────────────────────────────────────────────────────────
-
-fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-fn build_ca() -> (Certificate, KeyPair) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let cert = params.self_signed(&key_pair).unwrap();
-    (cert, key_pair)
-}
-
-fn build_server_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    (cert.pem(), key_pair.serialize_pem())
-}
-
-fn build_client_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    (cert.pem(), key_pair.serialize_pem())
 }
 
 struct TestServer {
@@ -597,7 +614,7 @@ async fn sandbox_get_policy_only_round_trip() {
 async fn sandbox_get_with_persisted_last_sandbox() {
     let ts = run_server().await;
     let xdg_dir = tempfile::tempdir().unwrap();
-    let _guard = EnvVarGuard::set("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap());
+    let _guard = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
 
     // Persist a last-used sandbox for "integration-cluster".
     save_last_sandbox("integration-cluster", "persisted-sb")
@@ -621,12 +638,51 @@ async fn sandbox_get_with_persisted_last_sandbox() {
     );
 }
 
+#[tokio::test]
+async fn policy_get_full_json_cli_prints_policy_payload() {
+    let ts = run_server().await;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    run::sandbox_policy_get_to_writer(
+        &ts.endpoint,
+        "my-sandbox",
+        0,
+        true,
+        "json",
+        &ts.tls,
+        (&mut stdout, &mut stderr),
+    )
+    .await
+    .expect("policy get should succeed");
+
+    assert!(
+        stderr.is_empty(),
+        "policy get should not print stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("stdout should be valid JSON");
+    assert_eq!(json["scope"], "sandbox");
+    assert_eq!(json["sandbox"], "my-sandbox");
+    assert_eq!(json["version"], 7);
+    assert_eq!(json["active_version"], 7);
+    assert_eq!(json["hash"], "sha256:test-policy");
+    assert_eq!(json["status"], "loaded");
+    assert_eq!(json["policy"]["network_policies"]["api"]["name"], "api");
+    assert_eq!(
+        json["policy"]["network_policies"]["api"]["endpoints"][0]["host"],
+        "api.example.com"
+    );
+}
+
 /// Verify that an explicit name takes precedence over the persisted one.
 #[tokio::test]
 async fn explicit_name_takes_precedence_over_persisted() {
     let ts = run_server().await;
     let xdg_dir = tempfile::tempdir().unwrap();
-    let _guard = EnvVarGuard::set("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap());
+    let _guard = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
 
     // Persist one name, but supply a different one explicitly.
     save_last_sandbox("my-cluster", "old-sandbox").expect("save should succeed");

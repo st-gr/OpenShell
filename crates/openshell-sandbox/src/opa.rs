@@ -3992,6 +3992,69 @@ network_policies:
     }
 
     #[test]
+    fn wildcard_host_intra_label_matches() {
+        // First-label intra-label wildcard: `*` matches the variable prefix
+        // within a single DNS label. Locks validator/runtime alignment for
+        // the pattern accepted by `validate_host_wildcard`.
+        let data = r#"
+network_policies:
+  intra_label:
+    name: intra_label
+    endpoints:
+      - { host: "*-aiplatform.googleapis.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "us-central1-aiplatform.googleapis.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "*-aiplatform.googleapis.com should match us-central1-aiplatform.googleapis.com: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn wildcard_host_intra_label_does_not_cross_dot() {
+        // `glob.match(..., ["."])` treats `.` as a label boundary that `*`
+        // cannot cross. `*-aiplatform.googleapis.com` must not match a host
+        // whose first label is `us-central1` and where `aiplatform` is a
+        // separate label.
+        let data = r#"
+network_policies:
+  intra_label:
+    name: intra_label
+    endpoints:
+      - { host: "*-aiplatform.googleapis.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "us-central1.aiplatform.googleapis.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            !decision.allowed,
+            "*-aiplatform.googleapis.com must NOT match us-central1.aiplatform.googleapis.com \
+             (would cross a `.` boundary)"
+        );
+    }
+
+    #[test]
     fn wildcard_host_multi_port() {
         let data = r#"
 network_policies:
@@ -4804,5 +4867,42 @@ network_policies:
             "After reload with PID, resolved path should be allowed: {}",
             decision.reason
         );
+    }
+
+    #[test]
+    fn l7_head_allowed_where_get_is_allowed() {
+        let engine = l7_engine();
+        let input = l7_input("api.example.com", 8080, "HEAD", "/repos/myorg/foo");
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_head_denied_when_only_post_allowed() {
+        let engine = OpaEngine::from_strings(
+            TEST_POLICY,
+            "network_policies:\n  p:\n    name: p\n    endpoints:\n      - host: h.test\n        port: 80\n        protocol: rest\n        enforcement: enforce\n        rules:\n          - allow: {method: POST, path: \"/\"}\n    binaries:\n      - {path: /usr/bin/curl}\n",
+        )
+        .unwrap();
+        let input = l7_input("h.test", 80, "HEAD", "/");
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_options_not_implicitly_allowed_by_get() {
+        let engine = l7_engine();
+        let input = l7_input("api.example.com", 8080, "OPTIONS", "/repos/myorg/foo");
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_head_blocked_by_deny_rule_targeting_get() {
+        // deny_rules use method_matches() too; a deny on GET must also block HEAD.
+        let engine = OpaEngine::from_strings(
+            TEST_POLICY,
+            "network_policies:\n  p:\n    name: p\n    endpoints:\n      - host: h.test\n        port: 80\n        protocol: rest\n        enforcement: enforce\n        access: full\n        deny_rules:\n          - method: GET\n            path: \"/protected\"\n    binaries:\n      - {path: /usr/bin/curl}\n",
+        )
+        .unwrap();
+        let input = l7_input("h.test", 80, "HEAD", "/protected");
+        assert!(!eval_l7(&engine, &input));
     }
 }

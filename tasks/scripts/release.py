@@ -224,11 +224,6 @@ def _asset_url(release_tag: str, filename: str) -> str:
     return f"{GITHUB_RELEASE_DOWNLOADS}/{release_tag}/{filename}"
 
 
-def _homebrew_supervisor_image(release_tag: str) -> str:
-    image_tag = "dev" if release_tag == "dev" else release_tag.removeprefix("v")
-    return f"ghcr.io/nvidia/openshell/supervisor:{image_tag}"
-
-
 def render_homebrew_formula(
     *,
     release_tag: str,
@@ -240,7 +235,6 @@ def render_homebrew_formula(
         raise ValueError(f"release tag contains unsupported characters: {release_tag}")
 
     version = release_tag.removeprefix("v")
-    docker_supervisor_image = _homebrew_supervisor_image(release_tag)
     return f"""# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -289,16 +283,40 @@ class Openshell < Formula
         exit 1
       fi
 
-      docker_tls_dir="${{OPENSHELL_DOCKER_TLS_DIR:-${{HOME}}/.local/state/openshell/homebrew/tls}}"
+      xdg_config_home="${{XDG_CONFIG_HOME:-${{HOME}}/.config}}"
+      xdg_gateway_env="${{xdg_config_home}}/openshell/gateway.env"
+      prefix_gateway_env="#{{var}}/openshell/gateway.env"
+      if [ -f "${{xdg_gateway_env}}" ]; then
+        set -a
+        . "${{xdg_gateway_env}}"
+        set +a
+      elif [ -f "${{prefix_gateway_env}}" ]; then
+        set -a
+        . "${{prefix_gateway_env}}"
+        set +a
+      fi
+
+      docker_tls_dir="${{HOME}}/.local/state/openshell/homebrew/tls"
+      mkdir -p "${{docker_tls_dir}}/server"
       mkdir -p "${{docker_tls_dir}}/client"
-      chmod 700 "${{docker_tls_dir}}" "${{docker_tls_dir}}/client"
+      mkdir -p "${{docker_tls_dir}}/jwt"
+      chmod 700 "${{docker_tls_dir}}" "${{docker_tls_dir}}/server" "${{docker_tls_dir}}/client" "${{docker_tls_dir}}/jwt"
       /usr/bin/install -m 0644 "#{{var}}/openshell/tls/ca.crt" "${{docker_tls_dir}}/ca.crt"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/server/tls.crt" "${{docker_tls_dir}}/server/tls.crt"
+      /usr/bin/install -m 0600 "#{{var}}/openshell/tls/server/tls.key" "${{docker_tls_dir}}/server/tls.key"
       /usr/bin/install -m 0644 "#{{var}}/openshell/tls/client/tls.crt" "${{docker_tls_dir}}/client/tls.crt"
       /usr/bin/install -m 0600 "#{{var}}/openshell/tls/client/tls.key" "${{docker_tls_dir}}/client/tls.key"
+      /usr/bin/install -m 0600 "#{{var}}/openshell/tls/jwt/signing.pem" "${{docker_tls_dir}}/jwt/signing.pem"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/jwt/public.pem" "${{docker_tls_dir}}/jwt/public.pem"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/jwt/kid" "${{docker_tls_dir}}/jwt/kid"
+      export OPENSHELL_LOCAL_TLS_DIR="${{OPENSHELL_LOCAL_TLS_DIR:-${{docker_tls_dir}}}}"
 
-      export OPENSHELL_DOCKER_TLS_CA="${{docker_tls_dir}}/ca.crt"
-      export OPENSHELL_DOCKER_TLS_CERT="${{docker_tls_dir}}/client/tls.crt"
-      export OPENSHELL_DOCKER_TLS_KEY="${{docker_tls_dir}}/client/tls.key"
+      xdg_gateway_config="${{xdg_config_home}}/openshell/gateway.toml"
+      prefix_gateway_config="#{{var}}/openshell/gateway.toml"
+
+      if [ -z "${{OPENSHELL_GATEWAY_CONFIG:-}}" ] && [ ! -f "${{xdg_gateway_config}}" ] && [ -f "${{prefix_gateway_config}}" ]; then
+        exec "#{{opt_bin}}/openshell-gateway" --config "${{prefix_gateway_config}}"
+      fi
 
       exec "#{{opt_bin}}/openshell-gateway"
     SH
@@ -328,26 +346,6 @@ class Openshell < Formula
 
   service do
     run opt_libexec/"openshell-gateway-homebrew-service"
-    environment_variables(
-      OPENSHELL_BIND_ADDRESS: "127.0.0.1",
-      OPENSHELL_SERVER_PORT: "{LOCAL_GATEWAY_PORT}",
-      OPENSHELL_TLS_CERT: "#{{var}}/openshell/tls/server/tls.crt",
-      OPENSHELL_TLS_KEY: "#{{var}}/openshell/tls/server/tls.key",
-      OPENSHELL_TLS_CLIENT_CA: "#{{var}}/openshell/tls/ca.crt",
-      OPENSHELL_DB_URL: "sqlite:#{{var}}/openshell/gateway/openshell.db",
-      OPENSHELL_GRPC_ENDPOINT: "https://127.0.0.1:{LOCAL_GATEWAY_PORT}",
-      OPENSHELL_SSH_GATEWAY_HOST: "127.0.0.1",
-      OPENSHELL_SSH_GATEWAY_PORT: "{LOCAL_GATEWAY_PORT}",
-      OPENSHELL_VM_DRIVER_STATE_DIR: "#{{var}}/openshell/vm-driver",
-      OPENSHELL_VM_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
-      OPENSHELL_VM_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
-      OPENSHELL_VM_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
-      OPENSHELL_DOCKER_SUPERVISOR_IMAGE: "{docker_supervisor_image}",
-      OPENSHELL_PODMAN_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
-      OPENSHELL_PODMAN_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
-      OPENSHELL_PODMAN_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
-      OPENSHELL_DRIVER_DIR: "#{{opt_libexec}}",
-    )
     keep_alive successful_exit: false
     log_path var/"log/openshell/openshell-gateway.out.log"
     error_log_path var/"log/openshell/openshell-gateway.err.log"
@@ -400,7 +398,7 @@ def generate_homebrew_formula(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="OpenClaw release tooling.")
+    parser = argparse.ArgumentParser(description="OpenShell release tooling.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     get_version_parser = sub.add_parser("get-version", help="Print computed version.")

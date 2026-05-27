@@ -3,6 +3,10 @@
 
 use super::*;
 use openshell_core::config::{CDI_GPU_DEVICE_ALL, DEFAULT_SERVER_PORT};
+use openshell_core::driver_utils::{
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
+    LABEL_SANDBOX_NAMESPACE,
+};
 use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
 };
@@ -33,6 +37,7 @@ fn test_sandbox() -> DriverSandbox {
             }),
             gpu: false,
             gpu_device: String::new(),
+            sandbox_token: String::new(),
         }),
         status: None,
     }
@@ -74,7 +79,7 @@ fn container_visible_endpoint_rewrites_loopback_hosts() {
             HOST_OPENSHELL_INTERNAL,
             DEFAULT_SERVER_PORT,
         ),
-        "https://host.openshell.internal:8080/"
+        "https://host.openshell.internal:17670/"
     );
     assert_eq!(
         docker_container_openshell_endpoint(
@@ -82,7 +87,7 @@ fn container_visible_endpoint_rewrites_loopback_hosts() {
             HOST_OPENSHELL_INTERNAL,
             DEFAULT_SERVER_PORT,
         ),
-        "http://host.openshell.internal:8080/"
+        "http://host.openshell.internal:17670/"
     );
     assert_eq!(
         docker_container_openshell_endpoint(
@@ -90,7 +95,7 @@ fn container_visible_endpoint_rewrites_loopback_hosts() {
             HOST_OPENSHELL_INTERNAL,
             DEFAULT_SERVER_PORT,
         ),
-        "https://host.openshell.internal:8080/"
+        "https://host.openshell.internal:17670/"
     );
 }
 
@@ -263,17 +268,18 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
         ..Default::default()
     };
 
-    let route = docker_gateway_route(
+    let route = docker_gateway_route_for_host(
         &info,
         IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         DEFAULT_SERVER_PORT,
         None,
+        false,
     );
 
     assert_eq!(
         route,
         DockerGatewayRoute::Bridge {
-            bind_address: "172.18.0.1:8080".parse().unwrap(),
+            bind_address: "172.18.0.1:17670".parse().unwrap(),
             host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         }
     );
@@ -283,6 +289,25 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
             "host.docker.internal:172.18.0.1".to_string(),
             "host.openshell.internal:172.18.0.1".to_string()
         ]
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_when_host_runtime_requires_it() {
+    let info = SystemInfo {
+        operating_system: Some("Ubuntu 24.04 LTS".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route_for_host(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(10, 89, 10, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+            true,
+        ),
+        DockerGatewayRoute::HostGateway
     );
 }
 
@@ -303,7 +328,7 @@ fn docker_gateway_route_prefers_configured_host_gateway_ip() {
     assert_eq!(
         route,
         DockerGatewayRoute::Bridge {
-            bind_address: "172.20.0.4:8080".parse().unwrap(),
+            bind_address: "172.20.0.4:17670".parse().unwrap(),
             host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 20, 0, 4)),
         }
     );
@@ -327,7 +352,7 @@ fn parse_optional_host_gateway_ip_rejects_invalid_values() {
         parse_optional_host_gateway_ip("not-an-ip")
             .unwrap_err()
             .to_string()
-            .contains("OPENSHELL_HOST_GATEWAY_IP")
+            .contains("host_gateway_ip")
     );
 }
 
@@ -367,6 +392,26 @@ fn docker_resource_limits_rejects_requests() {
 }
 
 #[test]
+fn docker_resource_limits_applies_cpu_and_memory_limits() {
+    let template = DriverSandboxTemplate {
+        image: "img".to_string(),
+        agent_socket_path: String::new(),
+        labels: HashMap::new(),
+        environment: HashMap::new(),
+        resources: Some(DriverResourceRequirements {
+            cpu_limit: "500m".to_string(),
+            memory_limit: "2Gi".to_string(),
+            ..Default::default()
+        }),
+        platform_config: None,
+    };
+
+    let limits = docker_resource_limits(&template).unwrap();
+    assert_eq!(limits.nano_cpus, Some(500_000_000));
+    assert_eq!(limits.memory_bytes, Some(2_147_483_648));
+}
+
+#[test]
 fn build_environment_sets_docker_tls_paths() {
     let env = build_environment(&test_sandbox(), &runtime_config());
     assert!(env.contains(&format!("OPENSHELL_TLS_CA={TLS_CA_MOUNT_PATH}")));
@@ -375,14 +420,6 @@ fn build_environment_sets_docker_tls_paths() {
     assert!(env.contains(&"TEMPLATE_ENV=template".to_string()));
     assert!(env.contains(&"SPEC_ENV=spec".to_string()));
     assert!(env.contains(&"OPENSHELL_SANDBOX_COMMAND=sleep infinity".to_string()));
-    assert!(
-        !env.iter()
-            .any(|entry| entry.starts_with("OPENSHELL_SSH_HANDSHAKE_SECRET="))
-    );
-    assert!(
-        !env.iter()
-            .any(|entry| entry.starts_with("OPENSHELL_SSH_HANDSHAKE_SKEW_SECS="))
-    );
 }
 
 #[test]
@@ -410,7 +447,7 @@ fn build_environment_keeps_path_driver_controlled() {
 
 #[test]
 fn build_binds_uses_docker_tls_directory() {
-    let binds = build_binds(&runtime_config());
+    let binds = build_binds(&test_sandbox(), &runtime_config()).unwrap();
     let targets = binds
         .iter()
         .filter_map(|bind| bind.split(':').nth(1).map(String::from))
@@ -427,14 +464,35 @@ fn build_binds_uses_docker_tls_directory() {
 }
 
 #[test]
+fn build_environment_uses_token_file_without_raw_token_env() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.sandbox_token = "secret.jwt.value".to_string();
+    spec.environment.insert(
+        openshell_core::sandbox_env::SANDBOX_TOKEN.to_string(),
+        "user-provided-token".to_string(),
+    );
+
+    let env = build_environment(&sandbox, &runtime_config());
+
+    assert!(!env.iter().any(|entry| {
+        entry.starts_with(&format!("{}=", openshell_core::sandbox_env::SANDBOX_TOKEN))
+    }));
+    assert!(env.contains(&format!(
+        "{}={SANDBOX_TOKEN_MOUNT_PATH}",
+        openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
+    )));
+}
+
+#[test]
 fn managed_container_label_filters_include_gateway_namespace() {
     let filters =
-        managed_container_label_filters("tenant-a", [format!("{SANDBOX_ID_LABEL_KEY}=sbx-123")]);
+        managed_container_label_filters("tenant-a", [format!("{LABEL_SANDBOX_ID}=sbx-123")]);
     let labels = filters.get("label").unwrap();
 
-    assert!(labels.contains(&format!("{MANAGED_BY_LABEL_KEY}={MANAGED_BY_LABEL_VALUE}")));
-    assert!(labels.contains(&format!("{SANDBOX_NAMESPACE_LABEL_KEY}=tenant-a")));
-    assert!(labels.contains(&format!("{SANDBOX_ID_LABEL_KEY}=sbx-123")));
+    assert!(labels.contains(&format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}")));
+    assert!(labels.contains(&format!("{LABEL_SANDBOX_NAMESPACE}=tenant-a")));
+    assert!(labels.contains(&format!("{LABEL_SANDBOX_ID}=sbx-123")));
 }
 
 #[test]
@@ -450,7 +508,7 @@ fn build_container_create_body_clears_inherited_cmd() {
         create_body
             .labels
             .as_ref()
-            .and_then(|labels| labels.get(SANDBOX_NAMESPACE_LABEL_KEY)),
+            .and_then(|labels| labels.get(LABEL_SANDBOX_NAMESPACE)),
         Some(&"default".to_string())
     );
     let host_config = create_body.host_config.as_ref().unwrap();
@@ -594,7 +652,7 @@ fn build_container_create_body_uses_runtime_namespace_label() {
     let labels = create_body.labels.expect("labels are populated");
 
     assert_eq!(
-        labels.get(SANDBOX_NAMESPACE_LABEL_KEY),
+        labels.get(LABEL_SANDBOX_NAMESPACE),
         Some(&"tenant-a".to_string()),
         "namespace label must reflect the driver's runtime config"
     );
@@ -606,12 +664,9 @@ fn driver_status_keeps_running_sandboxes_provisioning_with_stable_message() {
         id: Some("cid".to_string()),
         names: Some(vec!["/openshell-demo".to_string()]),
         labels: Some(HashMap::from([
-            (SANDBOX_ID_LABEL_KEY.to_string(), "sbx-1".to_string()),
-            (SANDBOX_NAME_LABEL_KEY.to_string(), "demo".to_string()),
-            (
-                SANDBOX_NAMESPACE_LABEL_KEY.to_string(),
-                "default".to_string(),
-            ),
+            (LABEL_SANDBOX_ID.to_string(), "sbx-1".to_string()),
+            (LABEL_SANDBOX_NAME.to_string(), "demo".to_string()),
+            (LABEL_SANDBOX_NAMESPACE.to_string(), "default".to_string()),
         ])),
         state: Some(ContainerSummaryStateEnum::RUNNING),
         status: Some("Up 2 seconds".to_string()),
@@ -663,12 +718,9 @@ fn driver_status_marks_restarting_sandboxes_as_error() {
         id: Some("cid".to_string()),
         names: Some(vec!["/openshell-demo".to_string()]),
         labels: Some(HashMap::from([
-            (SANDBOX_ID_LABEL_KEY.to_string(), "sbx-1".to_string()),
-            (SANDBOX_NAME_LABEL_KEY.to_string(), "demo".to_string()),
-            (
-                SANDBOX_NAMESPACE_LABEL_KEY.to_string(),
-                "default".to_string(),
-            ),
+            (LABEL_SANDBOX_ID.to_string(), "sbx-1".to_string()),
+            (LABEL_SANDBOX_NAME.to_string(), "demo".to_string()),
+            (LABEL_SANDBOX_NAMESPACE.to_string(), "default".to_string()),
         ])),
         state: Some(ContainerSummaryStateEnum::RESTARTING),
         status: Some("Restarting (1) 2 seconds ago".to_string()),
@@ -696,20 +748,17 @@ fn validate_linux_elf_binary_rejects_non_elf_files() {
 
 #[test]
 fn docker_guest_tls_paths_require_all_files_for_https() {
-    let config = Config::new(None).with_grpc_endpoint("https://localhost:8443");
     let tempdir = TempDir::new().unwrap();
     let ca = tempdir.path().join("ca.crt");
     fs::write(&ca, b"ca").unwrap();
 
-    let err = docker_guest_tls_paths(
-        &config,
-        &DockerComputeConfig {
-            guest_tls_ca: Some(ca),
-            ..Default::default()
-        },
-    )
+    let err = docker_guest_tls_paths(&DockerComputeConfig {
+        grpc_endpoint: "https://localhost:8443".to_string(),
+        guest_tls_ca: Some(ca),
+        ..Default::default()
+    })
     .unwrap_err();
-    assert!(err.to_string().contains("--docker-tls-cert"));
+    assert!(err.to_string().contains("guest_tls_cert"));
 }
 
 #[test]
@@ -786,26 +835,26 @@ fn trim_container_name_tail_strips_separators() {
 
 #[test]
 fn docker_guest_tls_paths_rejects_tls_flags_without_https() {
-    let config = Config::new(None).with_grpc_endpoint("http://localhost:8080");
     let tempdir = TempDir::new().unwrap();
     let ca = tempdir.path().join("ca.crt");
     fs::write(&ca, b"ca").unwrap();
 
-    let err = docker_guest_tls_paths(
-        &config,
-        &DockerComputeConfig {
-            guest_tls_ca: Some(ca),
-            ..Default::default()
-        },
-    )
+    let err = docker_guest_tls_paths(&DockerComputeConfig {
+        grpc_endpoint: "http://localhost:8080".to_string(),
+        guest_tls_ca: Some(ca),
+        ..Default::default()
+    })
     .unwrap_err();
     assert!(err.to_string().contains("https://"));
 }
 
 #[test]
 fn docker_guest_tls_paths_allows_plain_http_without_tls_flags() {
-    let config = Config::new(None).with_grpc_endpoint("http://localhost:8080");
-    let result = docker_guest_tls_paths(&config, &DockerComputeConfig::default()).unwrap();
+    let result = docker_guest_tls_paths(&DockerComputeConfig {
+        grpc_endpoint: "http://localhost:8080".to_string(),
+        ..Default::default()
+    })
+    .unwrap();
     assert!(result.is_none());
 }
 
@@ -852,6 +901,25 @@ fn docker_supervisor_image_tag_sanitizes_build_metadata_for_docker() {
         ),
         "0.0.37-dev.156-g1d3b741ee",
     );
+}
+
+#[test]
+fn docker_supervisor_image_refreshes_mutable_tags_only() {
+    assert!(supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor:dev"
+    ));
+    assert!(supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor:latest"
+    ));
+    assert!(supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor"
+    ));
+    assert!(!supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor:0.0.47-dev.13-g57b71c68f"
+    ));
+    assert!(!supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor@sha256:abc123"
+    ));
 }
 
 #[test]

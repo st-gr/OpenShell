@@ -127,6 +127,14 @@ echo "Building openshell-gateway..."
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
   -p openshell-server --bin openshell-gateway
 
+TLS_DIR="${STATE_DIR}/tls"
+echo "Generating local gateway credentials..."
+"${GATEWAY_BIN}" generate-certs \
+  --output-dir "${TLS_DIR}" \
+  --server-san "127.0.0.1" \
+  --server-san "localhost" \
+  --server-san "host.openshell.internal"
+
 echo "Building openshell-sandbox for ${SUPERVISOR_TARGET}..."
 if [[ "${HOST_OS}" == "Linux" && "${HOST_ARCH}" == "${DAEMON_ARCH}" ]]; then
   # Native Linux build — no cross-toolchain required.
@@ -156,6 +164,32 @@ fi
 chmod +x "${SUPERVISOR_BIN}"
 
 mkdir -p "${STATE_DIR}"
+CONFIG_PATH="${STATE_DIR}/gateway.toml"
+cat >"${CONFIG_PATH}" <<EOF
+[openshell]
+version = 1
+
+[openshell.gateway]
+compute_drivers = ["docker"]
+disable_tls = true
+
+[openshell.gateway.auth]
+allow_unauthenticated_users = true
+
+[openshell.gateway.gateway_jwt]
+signing_key_path = "${TLS_DIR}/jwt/signing.pem"
+public_key_path = "${TLS_DIR}/jwt/public.pem"
+kid_path = "${TLS_DIR}/jwt/kid"
+gateway_id = "${GATEWAY_NAME}"
+ttl_secs = 3600
+
+[openshell.drivers.docker]
+default_image = "${SANDBOX_IMAGE}"
+image_pull_policy = "${SANDBOX_IMAGE_PULL_POLICY}"
+sandbox_namespace = "${SANDBOX_NAMESPACE}"
+grpc_endpoint = "${GRPC_ENDPOINT}"
+supervisor_bin = "${SUPERVISOR_BIN}"
+EOF
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
@@ -172,13 +206,9 @@ echo "  openshell gateway select ${GATEWAY_NAME}"
 echo
 
 exec "${GATEWAY_BIN}" \
+  --config "${CONFIG_PATH}" \
   --port "${PORT}" \
   --log-level "${LOG_LEVEL}" \
   --drivers docker \
   --disable-tls \
-  --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc" \
-  --sandbox-namespace "${SANDBOX_NAMESPACE}" \
-  --sandbox-image "${SANDBOX_IMAGE}" \
-  --sandbox-image-pull-policy "${SANDBOX_IMAGE_PULL_POLICY}" \
-  --grpc-endpoint "${GRPC_ENDPOINT}" \
-  --docker-supervisor-bin "${SUPERVISOR_BIN}"
+  --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"

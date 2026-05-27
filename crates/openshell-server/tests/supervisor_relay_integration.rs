@@ -96,6 +96,15 @@ impl OpenShell for RelayGateway {
         Err(Status::unimplemented("unused"))
     }
 
+    type ExecSandboxInteractiveStream =
+        ReceiverStream<Result<openshell_core::proto::ExecSandboxEvent, Status>>;
+    async fn exec_sandbox_interactive(
+        &self,
+        _: tonic::Request<tonic::Streaming<openshell_core::proto::ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn health(
         &self,
         _: tonic::Request<openshell_core::proto::HealthRequest>,
@@ -261,6 +270,33 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn get_provider_refresh_status(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderRefreshStatusResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn configure_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::ConfigureProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn rotate_provider_credential(
+        &self,
+        _: tonic::Request<openshell_core::proto::RotateProviderCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::RotateProviderCredentialResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
 
     async fn delete_provider(
         &self,
@@ -356,6 +392,18 @@ impl OpenShell for RelayGateway {
         &self,
         _: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
     ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn issue_sandbox_token(
+        &self,
+        _: tonic::Request<openshell_core::proto::IssueSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn refresh_sandbox_token(
+        &self,
+        _: tonic::Request<openshell_core::proto::RefreshSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::RefreshSandboxTokenResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
 }

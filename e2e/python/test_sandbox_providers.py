@@ -353,20 +353,6 @@ def test_passthrough_and_canonical_credentials_coexist(
 # ===========================================================================
 
 
-def test_ssh_handshake_secret_not_visible_in_exec_environment(
-    sandbox: Callable[..., Sandbox],
-) -> None:
-    def read_handshake_secret() -> str:
-        import os
-
-        return os.environ.get("OPENSHELL_SSH_HANDSHAKE_SECRET", "NOT_SET")
-
-    with sandbox(delete_on_exit=True) as sb:
-        result = sb.exec_python(read_handshake_secret)
-        assert result.exit_code == 0, result.stderr
-        assert result.stdout.strip() == "NOT_SET"
-
-
 def test_create_sandbox_rejects_unknown_provider(
     sandbox_client: SandboxClient,
 ) -> None:

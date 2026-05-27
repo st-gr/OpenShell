@@ -3,8 +3,9 @@
 
 //! gRPC service implementation.
 
+mod auth_rpc;
 pub mod policy;
-mod provider;
+pub mod provider;
 mod sandbox;
 mod service;
 mod validation;
@@ -12,28 +13,32 @@ mod validation;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
     ApproveDraftChunkResponse, AttachSandboxProviderRequest, AttachSandboxProviderResponse,
-    ClearDraftChunksRequest, ClearDraftChunksResponse, CreateProviderRequest, CreateSandboxRequest,
+    ClearDraftChunksRequest, ClearDraftChunksResponse, ConfigureProviderRefreshRequest,
+    ConfigureProviderRefreshResponse, CreateProviderRequest, CreateSandboxRequest,
     CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderProfileRequest,
-    DeleteProviderProfileResponse, DeleteProviderRequest, DeleteProviderResponse,
-    DeleteSandboxRequest, DeleteSandboxResponse, DeleteServiceRequest, DeleteServiceResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
-    EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxRequest, ExposeServiceRequest,
-    GatewayMessage, GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest,
-    GetDraftPolicyResponse, GetGatewayConfigRequest, GetGatewayConfigResponse,
-    GetProviderProfileRequest, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
-    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    DeleteProviderProfileResponse, DeleteProviderRefreshRequest, DeleteProviderRefreshResponse,
+    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    DeleteServiceRequest, DeleteServiceResponse, DetachSandboxProviderRequest,
+    DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent,
+    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, GatewayMessage,
+    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
+    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderProfileRequest,
+    GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse, GetProviderRequest,
+    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     GetServiceRequest, HealthRequest, HealthResponse, ImportProviderProfilesRequest,
-    ImportProviderProfilesResponse, LintProviderProfilesRequest, LintProviderProfilesResponse,
-    ListProviderProfilesRequest, ListProviderProfilesResponse, ListProvidersRequest,
-    ListProvidersResponse, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, ListServicesRequest, ListServicesResponse, ProviderProfileResponse,
-    ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
-    RejectDraftChunkResponse, RelayFrame, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent,
-    ServiceEndpointResponse, ServiceStatus, SubmitPolicyAnalysisRequest,
+    ImportProviderProfilesResponse, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
+    LintProviderProfilesRequest, LintProviderProfilesResponse, ListProviderProfilesRequest,
+    ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest,
+    ListServicesResponse, ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest,
+    PushSandboxLogsResponse, RefreshSandboxTokenRequest, RefreshSandboxTokenResponse,
+    RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame, ReportPolicyStatusRequest,
+    ReportPolicyStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
+    SandboxStreamEvent, ServiceEndpointResponse, ServiceStatus, SubmitPolicyAnalysisRequest,
     SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
     UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse, UpdateProviderRequest,
     WatchSandboxRequest, open_shell_server::OpenShell,
@@ -63,6 +68,29 @@ pub const MAX_PAGE_SIZE: u32 = 1000;
 /// otherwise returns the smaller of `raw` and `max`.
 pub fn clamp_limit(raw: u32, default: u32, max: u32) -> u32 {
     if raw == 0 { default } else { raw.min(max) }
+}
+
+/// Map a `PersistenceError` to an appropriate gRPC `Status`.
+///
+/// CAS conflicts (optimistic concurrency failures) are mapped to `ABORTED`
+/// to signal that the client should retry with fresh data. Other persistence
+/// errors are mapped to `INTERNAL`.
+pub fn persistence_error_to_status(
+    err: crate::persistence::PersistenceError,
+    operation: &str,
+) -> Status {
+    use crate::persistence::PersistenceError;
+
+    match err {
+        PersistenceError::Conflict {
+            current_resource_version,
+        } => Status::aborted(format!(
+            "{} failed due to concurrent modification (current resource_version: {})",
+            operation,
+            current_resource_version.map_or_else(|| "unknown".to_string(), |v| v.to_string())
+        )),
+        other => Status::internal(format!("{operation} failed: {other}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +132,10 @@ const MAX_PROVIDER_CONFIG_ENTRIES: usize = 64;
 struct StoredSettings {
     revision: u64,
     settings: BTreeMap<String, StoredSettingValue>,
+    /// Database `resource_version` for CAS. Not persisted in the JSON payload;
+    /// loaded from `ObjectRecord` and used for optimistic concurrency control.
+    #[serde(skip)]
+    resource_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,9 +152,8 @@ enum StoredSettingValue {
 // Utility
 // ---------------------------------------------------------------------------
 
-fn current_time_ms() -> Result<i64, std::time::SystemTimeError> {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
-    Ok(i64::try_from(now.as_millis()).unwrap_or(i64::MAX))
+fn current_time_ms() -> i64 {
+    openshell_core::time::now_ms()
 }
 
 /// Validate that object metadata is present and contains required fields.
@@ -254,6 +285,15 @@ impl OpenShell for OpenShellService {
         sandbox::handle_forward_tcp(&self.state, request).await
     }
 
+    type ExecSandboxInteractiveStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;
+
+    async fn exec_sandbox_interactive(
+        &self,
+        request: Request<tonic::Streaming<ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        sandbox::handle_exec_sandbox_interactive(&self.state, request).await
+    }
+
     // --- SSH sessions ---
 
     async fn create_ssh_session(
@@ -354,6 +394,34 @@ impl OpenShell for OpenShellService {
         request: Request<UpdateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
         provider::handle_update_provider(&self.state, request).await
+    }
+
+    async fn get_provider_refresh_status(
+        &self,
+        request: Request<GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<GetProviderRefreshStatusResponse>, Status> {
+        provider::handle_get_provider_refresh_status(&self.state, request).await
+    }
+
+    async fn configure_provider_refresh(
+        &self,
+        request: Request<ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
+        provider::handle_configure_provider_refresh(&self.state, request).await
+    }
+
+    async fn rotate_provider_credential(
+        &self,
+        request: Request<RotateProviderCredentialRequest>,
+    ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
+        provider::handle_rotate_provider_credential(&self.state, request).await
+    }
+
+    async fn delete_provider_refresh(
+        &self,
+        request: Request<DeleteProviderRefreshRequest>,
+    ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
+        provider::handle_delete_provider_refresh(&self.state, request).await
     }
 
     async fn delete_provider(
@@ -502,6 +570,22 @@ impl OpenShell for OpenShellService {
         policy::handle_get_draft_history(&self.state, request).await
     }
 
+    // --- Sandbox identity ---
+
+    async fn issue_sandbox_token(
+        &self,
+        request: Request<IssueSandboxTokenRequest>,
+    ) -> Result<Response<IssueSandboxTokenResponse>, Status> {
+        auth_rpc::handle_issue_sandbox_token(&self.state, request).await
+    }
+
+    async fn refresh_sandbox_token(
+        &self,
+        request: Request<RefreshSandboxTokenRequest>,
+    ) -> Result<Response<RefreshSandboxTokenResponse>, Status> {
+        auth_rpc::handle_refresh_sandbox_token(&self.state, request).await
+    }
+
     // --- Supervisor session ---
 
     type ConnectSupervisorStream =
@@ -523,6 +607,45 @@ impl OpenShell for OpenShellService {
     ) -> Result<Response<Self::RelayStreamStream>, Status> {
         crate::supervisor_session::handle_relay_stream(&self.state.supervisor_sessions, request)
             .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared test support
+// ---------------------------------------------------------------------------
+
+/// Shared test helpers for grpc submodule unit tests.
+#[cfg(test)]
+pub mod test_support {
+    use std::sync::Arc;
+
+    use crate::ServerState;
+    use crate::compute::new_test_runtime;
+    use crate::persistence::Store;
+    use crate::sandbox_index::SandboxIndex;
+    use crate::sandbox_watch::SandboxWatchBus;
+    use crate::supervisor_session::SupervisorSessionRegistry;
+    use crate::tracing_bus::TracingLogBus;
+    use openshell_core::Config;
+
+    /// Build an in-memory `ServerState` for unit tests.
+    pub async fn test_server_state() -> Arc<ServerState> {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        let compute = new_test_runtime(store.clone()).await;
+        Arc::new(ServerState::new(
+            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        ))
     }
 }
 

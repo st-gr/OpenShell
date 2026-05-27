@@ -27,6 +27,22 @@ openshell gateway add http://127.0.0.1:18080 --local --name local
 openshell gateway select local
 ```
 
+### CPU and Memory
+
+Set per-sandbox CPU and memory amounts with `--cpu` and `--memory`:
+
+```shell
+openshell sandbox create --cpu 2 --memory 4Gi -- claude
+```
+
+CPU values use Kubernetes-style quantities such as `500m`, `1`, or `2.5`.
+Memory values use byte quantities such as `512Mi`, `4Gi`, or `8G`.
+
+Docker and Podman apply these values as runtime limits. Kubernetes applies each
+value as both the request and the limit so the scheduler reserves the same
+amount the sandbox can use. The VM driver currently accepts these flags but
+does not change VM allocation.
+
 ### GPU Resources
 
 To request GPU resources, add `--gpu`:
@@ -45,13 +61,12 @@ Use `--from` to create a sandbox from the base image, another pre-built sandbox 
 
 ```shell
 openshell sandbox create --from base
-openshell sandbox create --from openclaw
 openshell sandbox create --from ollama
 openshell sandbox create --from ./my-sandbox-dir
 openshell sandbox create --from my-registry.example.com/my-image:latest
 ```
 
-Bare names such as `base`, `openclaw`, and `ollama` resolve to images under `ghcr.io/nvidia/openshell-community/sandboxes`. Set `OPENSHELL_COMMUNITY_REGISTRY` when you need to use an internal mirror.
+Bare names such as `base` and `ollama` resolve to images under `ghcr.io/nvidia/openshell-community/sandboxes`. Set `OPENSHELL_COMMUNITY_REGISTRY` when you need to use an internal mirror.
 
 Local directories and Dockerfiles require a local gateway because the CLI builds
 through the local Docker daemon. Use a registry image reference for remote
@@ -195,6 +210,13 @@ Filter the list by labels when you want a narrower view:
 openshell sandbox list --selector team=platform
 ```
 
+Use `-o json` or `-o yaml` for machine-readable output:
+
+```shell
+openshell sandbox list -o json
+openshell sandbox list -o yaml
+```
+
 Get detailed information about a specific sandbox. The output lists **Policy source** (`sandbox` or `global`), **Revision** (the active policy’s row version for that source), and the formatted active policy YAML:
 
 ```shell
@@ -278,6 +300,10 @@ Download files from the sandbox to your host:
 ```shell
 openshell sandbox download my-sandbox /sandbox/output ./local
 ```
+
+When the sandbox-side source is a single file, the destination follows `cp`-style placement: if the destination already exists as a directory or ends with `/`, the file lands inside it as `<dest>/<basename>`; otherwise the file is written at the exact destination path.
+
+The CLI only allows sandbox-side sources that resolve inside the writable workspace (`/sandbox`). Paths that escape lexically (`/etc/passwd`, `/sandbox/../etc/passwd`) and paths that escape through a symlink (`/sandbox/etc-link` pointing at `/etc`) are both refused before any data is transferred.
 
 <Note>
 You can also upload files at creation time with the `--upload` flag on

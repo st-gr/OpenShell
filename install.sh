@@ -19,6 +19,7 @@ LOCAL_GATEWAY_PORT="17670"
 HOMEBREW_TAP="nvidia/openshell"
 HOMEBREW_FORMULA_NAME="openshell"
 BREAKING_RELEASE_VERSION="0.0.37"
+LINUX_PACKAGE_GLIBC_MIN_VERSION="2.31"
 UPGRADE_NOTICE_ACK="${OPENSHELL_ACK_BREAKING_UPGRADE:-}"
 
 info() {
@@ -116,6 +117,104 @@ semver_at_least() {
   [ "$_minor" -gt "$_min_minor" ] && return 0
   [ "$_minor" -lt "$_min_minor" ] && return 1
   [ "$_patch" -ge "$_min_patch" ]
+}
+
+version_at_least_major_minor() {
+  _version="$1"
+  _minimum="$2"
+
+  _major="${_version%%.*}"
+  _minor="${_version#*.}"
+  _minor="${_minor%%.*}"
+
+  _min_major="${_minimum%%.*}"
+  _min_minor="${_minimum#*.}"
+  _min_minor="${_min_minor%%.*}"
+
+  case "$_major:$_minor:$_min_major:$_min_minor" in
+    *[!0-9:]* | *::*)
+      return 1
+      ;;
+  esac
+
+  [ "$_major" -gt "$_min_major" ] && return 0
+  [ "$_major" -lt "$_min_major" ] && return 1
+  [ "$_minor" -ge "$_min_minor" ]
+}
+
+getconf_gnu_libc_version() {
+  if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" = "1" ] && [ "${OPENSHELL_TEST_GETCONF_UNAVAILABLE:-0}" = "1" ]; then
+    return 127
+  fi
+
+  if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" = "1" ] && [ "${OPENSHELL_TEST_GETCONF_OUTPUT+x}" = "x" ]; then
+    printf '%s\n' "$OPENSHELL_TEST_GETCONF_OUTPUT"
+    return 0
+  fi
+
+  getconf GNU_LIBC_VERSION 2>/dev/null
+}
+
+ldd_version_output() {
+  if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" = "1" ] && [ "${OPENSHELL_TEST_LDD_UNAVAILABLE:-0}" = "1" ]; then
+    return 127
+  fi
+
+  if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" = "1" ] && [ "${OPENSHELL_TEST_LDD_OUTPUT+x}" = "x" ]; then
+    printf '%s\n' "$OPENSHELL_TEST_LDD_OUTPUT"
+    return 0
+  fi
+
+  ldd --version 2>&1
+}
+
+detect_glibc_version() {
+  _ldd_output="$(ldd_version_output 2>&1 || true)"
+  case "$_ldd_output" in
+    *[Mm][Uu][Ss][Ll]* | *[Aa][Ll][Pp][Ii][Nn][Ee]*)
+      return 2
+      ;;
+  esac
+
+  _ldd_version="$(printf '%s\n' "$_ldd_output" | awk 'FNR == 1 && match($NF, /^[0-9]+\.[0-9]+/) { print substr($NF, RSTART, RLENGTH); exit }')"
+  if [ -n "$_ldd_version" ]; then
+    printf '%s\n' "$_ldd_version"
+    return 0
+  fi
+
+  _getconf_output="$(getconf_gnu_libc_version 2>/dev/null || true)"
+  case "$_getconf_output" in
+    glibc\ [0-9]*.[0-9]*)
+      printf '%s\n' "${_getconf_output#glibc }"
+      return 0
+      ;;
+    *[Mm][Uu][Ss][Ll]* | *[Aa][Ll][Pp][Ii][Nn][Ee]*)
+      return 2
+      ;;
+  esac
+
+  return 1
+}
+
+require_linux_package_glibc() {
+  _glibc_status=0
+  _glibc_version="$(detect_glibc_version)" || _glibc_status=$?
+
+  case "$_glibc_status" in
+    0)
+      ;;
+    2)
+      error "OpenShell Linux packages require glibc >= ${LINUX_PACKAGE_GLIBC_MIN_VERSION}; detected musl or unsupported libc."
+      ;;
+    *)
+      error "OpenShell Linux packages require glibc >= ${LINUX_PACKAGE_GLIBC_MIN_VERSION}; could not detect glibc."
+      ;;
+  esac
+
+  if ! version_at_least_major_minor "$_glibc_version" "$LINUX_PACKAGE_GLIBC_MIN_VERSION"; then
+    error "OpenShell Linux packages require glibc >= ${LINUX_PACKAGE_GLIBC_MIN_VERSION}; detected glibc ${_glibc_version}.
+Please use a newer distribution or container environment."
+  fi
 }
 
 target_uses_breaking_gateway_model() {
@@ -603,6 +702,64 @@ start_user_gateway() {
   wait_for_local_gateway_status
 }
 
+dump_local_gateway_diagnostics() {
+  _lines="${OPENSHELL_INSTALL_LOG_LINES:-80}"
+  case "$_lines" in
+    "" | *[!0-9]*)
+      _lines=80
+      ;;
+  esac
+
+  info "dumping recent local gateway diagnostics..."
+  case "${PLATFORM:-}" in
+    darwin)
+      dump_homebrew_gateway_diagnostics "$_lines"
+      ;;
+    linux)
+      dump_user_service_gateway_diagnostics "$_lines"
+      ;;
+    *)
+      info "no gateway log collector is available for platform: ${PLATFORM:-unknown}"
+      ;;
+  esac
+}
+
+dump_homebrew_gateway_diagnostics() {
+  _lines="$1"
+  _brew_prefix="$(as_target_user brew --prefix 2>/dev/null || true)"
+  [ -n "$_brew_prefix" ] || _brew_prefix="/opt/homebrew"
+
+  info "Homebrew service status:"
+  as_target_user brew services info "${HOMEBREW_TAP}/${HOMEBREW_FORMULA_NAME}" >&2 || true
+
+  for _log_file in \
+    "${_brew_prefix}/var/log/openshell/openshell-gateway.err.log" \
+    "${_brew_prefix}/var/log/openshell/openshell-gateway.out.log"; do
+    if [ -f "$_log_file" ]; then
+      info "last ${_lines} lines from ${_log_file}:"
+      tail -n "$_lines" "$_log_file" >&2 || true
+    else
+      info "gateway log not found: ${_log_file}"
+    fi
+  done
+}
+
+dump_user_service_gateway_diagnostics() {
+  _lines="$1"
+
+  if has_cmd systemctl; then
+    info "openshell-gateway user service status:"
+    as_target_user systemctl --user status openshell-gateway --no-pager >&2 || true
+  fi
+
+  if has_cmd journalctl; then
+    info "last ${_lines} lines from openshell-gateway user journal:"
+    as_target_user journalctl --user -u openshell-gateway --no-pager -n "$_lines" >&2 || true
+  else
+    info "journalctl not found; cannot dump openshell-gateway user journal"
+  fi
+}
+
 wait_for_local_gateway_listener() {
   _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
@@ -622,7 +779,8 @@ wait_for_local_gateway_listener() {
     _elapsed=$((_elapsed + 1))
   done
 
-  printf '%s\n' "$_last_output" >&2
+  [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
+  dump_local_gateway_diagnostics
   error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
 }
 
@@ -646,7 +804,8 @@ wait_for_local_gateway_status() {
     _elapsed=$((_elapsed + 1))
   done
 
-  printf '%s\n' "$_status_output" >&2
+  [ -z "$_status_output" ] || printf '%s\n' "$_status_output" >&2
+  dump_local_gateway_diagnostics
   error "openshell status did not report connected within ${_timeout}s"
 }
 
@@ -874,6 +1033,7 @@ main() {
 
   case "$PLATFORM" in
     linux)
+      require_linux_package_glibc
       case "$(linux_package_method)" in
         deb)
           install_linux_deb
@@ -895,4 +1055,6 @@ main() {
   esac
 }
 
-main "$@"
+if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" != "1" ]; then
+  main "$@"
+fi

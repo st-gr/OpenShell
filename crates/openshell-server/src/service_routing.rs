@@ -803,6 +803,7 @@ mod tests {
                 name: "my-sandbox--web".to_string(),
                 created_at_ms: 1_700_000_000_000,
                 labels: std::collections::HashMap::default(),
+                resource_version: 0,
             }),
             sandbox_id: "sandbox-id".to_string(),
             sandbox_name: "my-sandbox".to_string(),
@@ -826,8 +827,8 @@ mod tests {
         openshell_core::TlsConfig {
             cert_path: "server.crt".into(),
             key_path: "server.key".into(),
-            client_ca_path: "ca.crt".into(),
-            allow_unauthenticated: false,
+            client_ca_path: Some("ca.crt".into()),
+            require_client_auth: false,
         }
     }
 
