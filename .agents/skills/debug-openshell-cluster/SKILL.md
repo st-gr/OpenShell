@@ -67,6 +67,33 @@ docker run --rm --entrypoint /openshell-sandbox "${OPENSHELL_DOCKER_SUPERVISOR_I
 openshell status
 ```
 
+For Docker GPU failures, check CDI support and NVIDIA CDI discovery separately:
+
+```bash
+docker info --format '{{json .CDISpecDirs}}'
+docker info --format '{{json .DiscoveredDevices}}'
+for dir in /etc/cdi /var/run/cdi; do
+  if [ -d "$dir" ]; then
+    find "$dir" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.json' \) -print
+  else
+    echo "$dir missing"
+  fi
+done
+systemctl is-enabled nvidia-cdi-refresh.service nvidia-cdi-refresh.path || true
+systemctl is-active nvidia-cdi-refresh.service nvidia-cdi-refresh.path || true
+systemctl status nvidia-cdi-refresh.service nvidia-cdi-refresh.path --no-pager --lines=50
+journalctl -u nvidia-cdi-refresh.service --no-pager --lines=100
+```
+
+When the NVIDIA Container Toolkit CDI refresh units are not enabled or no NVIDIA CDI spec has been generated, enable them and trigger a refresh:
+
+```bash
+sudo systemctl enable --now nvidia-cdi-refresh.path
+sudo systemctl enable --now nvidia-cdi-refresh.service
+sudo systemctl restart nvidia-cdi-refresh.service
+docker info --format '{{json .DiscoveredDevices}}'
+```
+
 Common findings:
 
 - Docker daemon unavailable: start Docker Desktop or Docker Engine.
@@ -75,6 +102,7 @@ Common findings:
 - Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify `OPENSHELL_DOCKER_SUPERVISOR_BIN`, the sibling binary next to `openshell-gateway`, or the configured supervisor image contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and supervisor callback endpoint.
 - Supervisor image exits before printing `openshell-sandbox --version`: the image should be the scratch supervisor image from `deploy/docker/Dockerfile.supervisor` and must contain a static executable at `/openshell-sandbox`.
+- `mise run e2e:docker:gpu` fails with `docker info --format json did not report any discovered NVIDIA CDI GPU devices`: Docker may report `CDISpecDirs` while still having no generated NVIDIA CDI specs. Verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. NVIDIA recommends enabling the path and service units, and restarting `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs. If specs are generated but Docker still reports no discovered devices, restart Docker or reload the daemon and re-check `docker info`.
 
 For source checkout development, restart the local gateway with:
 
@@ -116,8 +144,15 @@ Check required Helm deployment secrets:
 kubectl -n openshell get secret \
   openshell-server-tls \
   openshell-server-client-ca \
-  openshell-client-tls
+  openshell-client-tls \
+  openshell-jwt-keys
 ```
+
+If the gateway exits with `failed to read sandbox JWT signing key from
+/etc/openshell-jwt/signing.pem`, verify that `openshell-jwt-keys` contains
+`signing.pem`, `public.pem`, and `kid`, and that the StatefulSet mounts the
+`sandbox-jwt` secret at `/etc/openshell-jwt`. The sandbox JWT mount is required
+even when local Helm values disable TLS.
 
 Check the image references currently used by the gateway deployment:
 
@@ -177,6 +212,18 @@ helm -n openshell get values openshell | grep sandboxNamespace
 
 Then inspect sandbox resources in that namespace.
 
+Check the configured sandbox service account when TokenReview bootstrap or
+sandbox registration fails. Helm creates a dedicated sandbox service account by
+default and writes it to `[openshell.drivers.kubernetes].service_account_name`;
+the gateway rejects projected tokens from other service accounts.
+
+```bash
+helm -n openshell get values openshell | grep -A3 sandboxServiceAccount
+kubectl -n <sandbox-namespace> get serviceaccount openshell-sandbox
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}'
+kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
+```
+
 ### Step 6: Check VM-Backed Gateways
 
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:
@@ -200,6 +247,7 @@ openshell logs <sandbox-name>
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
+| Docker GPU e2e fails before GPU sandbox comparison | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs statefulset/openshell` |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |

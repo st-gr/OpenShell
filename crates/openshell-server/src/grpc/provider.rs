@@ -302,12 +302,17 @@ pub(super) async fn delete_provider_record(store: &Store, name: &str) -> Result<
         .map_err(|e| Status::internal(format!("delete provider failed: {e}")))
 }
 
-async fn sandboxes_using_provider(
-    store: &Store,
-    provider_name: &str,
-) -> Result<Vec<String>, Status> {
-    let mut blocking = Vec::new();
-    let mut offset = 0;
+/// Iterate over every `Sandbox` in the store and collect items produced by
+/// `f`.  `f` receives each decoded sandbox; returning `Some(T)` includes the
+/// value in the output, `None` skips it.
+///
+/// This is the shared pagination kernel used by all sandbox-scan helpers.
+async fn scan_sandboxes<T, F>(store: &Store, mut f: F) -> Result<Vec<T>, Status>
+where
+    F: FnMut(Sandbox) -> Option<T>,
+{
+    let mut out = Vec::new();
+    let mut offset = 0u32;
     loop {
         let records = store
             .list(Sandbox::object_type(), 1000, offset)
@@ -322,56 +327,50 @@ async fn sandboxes_using_provider(
                     .map_err(|_| Status::internal("sandbox page size exceeded u32"))?,
             )
             .ok_or_else(|| Status::internal("sandbox pagination offset overflow"))?;
-
         for record in records {
             let sandbox = Sandbox::decode(record.payload.as_slice())
                 .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
-            let Some(spec) = sandbox.spec.as_ref() else {
-                continue;
-            };
-            if spec.providers.iter().any(|name| name == provider_name) {
-                blocking.push(sandbox.object_name().to_string());
+            if let Some(item) = f(sandbox) {
+                out.push(item);
             }
         }
     }
-    blocking.sort();
-    blocking.dedup();
-    Ok(blocking)
+    Ok(out)
+}
+
+async fn sandboxes_using_provider(
+    store: &Store,
+    provider_name: &str,
+) -> Result<Vec<String>, Status> {
+    let provider_name = provider_name.to_string();
+    let mut names = scan_sandboxes(store, |sandbox| {
+        let spec = sandbox.spec.as_ref()?;
+        if spec.providers.iter().any(|n| n == &provider_name) {
+            Some(sandbox.object_name().to_string())
+        } else {
+            None
+        }
+    })
+    .await?;
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 async fn sandboxes_using_provider_records(
     store: &Store,
     provider_name: &str,
 ) -> Result<Vec<Sandbox>, Status> {
-    let mut sandboxes = Vec::new();
-    let mut offset = 0;
-    loop {
-        let records = store
-            .list(Sandbox::object_type(), 1000, offset)
-            .await
-            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
-        if records.is_empty() {
-            break;
+    let provider_name = provider_name.to_string();
+    scan_sandboxes(store, |sandbox| {
+        let spec = sandbox.spec.as_ref()?;
+        if spec.providers.iter().any(|n| n == &provider_name) {
+            Some(sandbox)
+        } else {
+            None
         }
-        offset = offset
-            .checked_add(
-                u32::try_from(records.len())
-                    .map_err(|_| Status::internal("sandbox page size exceeded u32"))?,
-            )
-            .ok_or_else(|| Status::internal("sandbox pagination offset overflow"))?;
-
-        for record in records {
-            let sandbox = Sandbox::decode(record.payload.as_slice())
-                .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
-            let Some(spec) = sandbox.spec.as_ref() else {
-                continue;
-            };
-            if spec.providers.iter().any(|name| name == provider_name) {
-                sandboxes.push(sandbox);
-            }
-        }
-    }
-    Ok(sandboxes)
+    })
+    .await
 }
 
 /// Merge an incoming map into an existing map.
@@ -1070,41 +1069,31 @@ fn has_errors(diagnostics: &[ProfileValidationDiagnostic]) -> bool {
 }
 
 async fn sandboxes_using_profile(store: &Store, profile_id: &str) -> Result<Vec<String>, Status> {
-    let mut blocking = Vec::new();
-    let mut offset = 0;
-    loop {
-        let records = store
-            .list(Sandbox::object_type(), 1000, offset)
-            .await
-            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
-        if records.is_empty() {
-            break;
-        }
-        offset = offset
-            .checked_add(
-                u32::try_from(records.len())
-                    .map_err(|_| Status::internal("sandbox page size exceeded u32"))?,
-            )
-            .ok_or_else(|| Status::internal("sandbox pagination offset overflow"))?;
+    // Collect all sandboxes that reference at least one provider — pagination
+    // is handled by `scan_sandboxes`; the async provider lookup happens below.
+    let candidates = scan_sandboxes(store, |sandbox| {
+        let has_providers = sandbox
+            .spec
+            .as_ref()
+            .is_some_and(|s| !s.providers.is_empty());
+        has_providers.then_some(sandbox)
+    })
+    .await?;
 
-        for record in records {
-            let sandbox = Sandbox::decode(record.payload.as_slice())
-                .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
-            let Some(spec) = sandbox.spec.as_ref() else {
+    let mut blocking = Vec::new();
+    for sandbox in candidates {
+        let spec = sandbox.spec.as_ref().expect("filtered by scan_sandboxes");
+        for provider_name in &spec.providers {
+            let Some(provider) = store
+                .get_message_by_name::<Provider>(provider_name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+            else {
                 continue;
             };
-            for provider_name in &spec.providers {
-                let Some(provider) = store
-                    .get_message_by_name::<Provider>(provider_name)
-                    .await
-                    .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
-                else {
-                    continue;
-                };
-                if normalize_profile_id(&provider.r#type).as_deref() == Some(profile_id) {
-                    blocking.push(sandbox.object_name().to_string());
-                    break;
-                }
+            if normalize_profile_id(&provider.r#type).as_deref() == Some(profile_id) {
+                blocking.push(sandbox.object_name().to_string());
+                break;
             }
         }
     }
@@ -1563,6 +1552,12 @@ mod tests {
     use super::*;
     use crate::grpc::MAX_MAP_KEY_LEN;
     use crate::grpc::test_support::test_server_state;
+
+    async fn test_store() -> Store {
+        Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("in-memory SQLite store should connect")
+    }
     use openshell_core::proto::{
         DeleteProviderProfileRequest, GetProviderProfileRequest, ImportProviderProfilesRequest,
         L7Allow, L7Rule, LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkBinary,
@@ -1667,6 +1662,7 @@ mod tests {
             endpoints: Vec::new(),
             binaries: Vec::new(),
             inference_capable: false,
+            discovery: None,
         }
     }
 
@@ -2077,6 +2073,7 @@ mod tests {
                             harness: true,
                         }],
                         inference_capable: false,
+                        discovery: None,
                     }),
                     source: "advanced-api.yaml".to_string(),
                 }],
@@ -2770,9 +2767,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_crud_round_trip_and_semantics() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("gitlab-local", "gitlab");
         let persisted = create_provider_record(&store, created.clone())
@@ -2864,9 +2859,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_provider_removes_scoped_refresh_states() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let provider = create_provider_record(
             &store,
@@ -2913,9 +2906,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_provider_rejects_attached_provider() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         create_provider_record(&store, provider_with_values("gitlab-local", "gitlab"))
             .await
@@ -2951,9 +2942,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_create_and_update_return_correct_resource_version() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         // Create provider and verify resource_version: 1 in response
         let created = provider_with_values("test-provider", "openai");
@@ -3111,6 +3100,7 @@ mod tests {
                         endpoints: vec![],
                         binaries: vec![],
                         inference_capable: false,
+                        discovery: None,
                     }),
                     source: "delegated-refresh-api.yaml".to_string(),
                 }],
@@ -3239,9 +3229,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_empty_maps_is_noop() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("noop-test", "nvidia");
         let persisted = create_provider_record(&store, created).await.unwrap();
@@ -3288,9 +3276,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_empty_value_deletes_key() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("delete-key-test", "openai");
         create_provider_record(&store, created).await.unwrap();
@@ -3341,9 +3327,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_empty_type_preserves_existing() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("type-preserve-test", "anthropic");
         create_provider_record(&store, created).await.unwrap();
@@ -3372,9 +3356,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_rejects_type_change() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("type-change-test", "nvidia");
         create_provider_record(&store, created).await.unwrap();
@@ -3404,9 +3386,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_validates_merged_result() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("validate-merge-test", "gitlab");
         create_provider_record(&store, created).await.unwrap();
@@ -3436,14 +3416,14 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_empty_list_returns_empty() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let result = resolve_provider_environment(&store, &[]).await.unwrap();
         assert!(result.is_empty());
     }
 
     #[tokio::test]
     async fn resolve_provider_env_injects_credentials() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let provider = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
@@ -3478,7 +3458,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_skips_expired_credentials_and_returns_expiry_metadata() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let now_ms = crate::persistence::current_time_ms();
         let provider = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -3518,7 +3498,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_unknown_name_returns_error() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let err = resolve_provider_environment(&store, &["nonexistent".to_string()])
             .await
             .unwrap_err();
@@ -3528,7 +3508,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_skips_invalid_credential_keys() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let provider = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
@@ -3560,7 +3540,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_multiple_providers_merge() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         create_provider_record(
             &store,
             Provider {
@@ -3615,7 +3595,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_rejects_duplicate_credential_keys() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         create_provider_record(
             &store,
             Provider {
@@ -3672,7 +3652,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_rejects_credential_key_collision_for_attached_sandbox() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         create_provider_record(
             &store,
             Provider {
@@ -3765,7 +3745,7 @@ mod tests {
     async fn handler_flow_resolves_credentials_from_sandbox_providers() {
         use openshell_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
 
         create_provider_record(
             &store,
@@ -3825,7 +3805,7 @@ mod tests {
     async fn handler_flow_returns_empty_when_no_providers() {
         use openshell_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
 
         let sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -3859,14 +3839,14 @@ mod tests {
     async fn handler_flow_returns_none_for_unknown_sandbox() {
         use openshell_core::proto::Sandbox;
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let result = store.get_message::<Sandbox>("nonexistent").await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn update_provider_validates_before_write() {
-        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let store = Arc::new(test_store().await);
 
         // Create a valid provider
         let provider = provider_with_values("test-validate-provider", "test-type");
@@ -3938,11 +3918,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_create_provider_rejects_duplicate() {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(test_store().await);
 
         let provider = provider_with_values("test-concurrent-provider", "test-type");
 

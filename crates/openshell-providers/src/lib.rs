@@ -16,7 +16,7 @@ use std::path::Path;
 pub use openshell_core::proto::Provider;
 
 pub use context::{DiscoveryContext, RealDiscoveryContext};
-pub use discovery::discover_with_spec;
+pub use discovery::{discover_from_profile, discover_with_spec};
 pub use profiles::{
     CredentialRefreshProfile, ProfileError, ProfileValidationDiagnostic, ProviderTypeProfile,
     default_profiles, get_default_profile, normalize_profile_id, parse_profile_json,
@@ -28,6 +28,13 @@ pub use profiles::{
 pub enum ProviderError {
     #[error("unsupported provider type: {0}")]
     UnsupportedProvider(String),
+    #[error(
+        "provider profile '{profile_id}' discovery references unknown credential '{credential_name}'"
+    )]
+    UnknownDiscoveryCredential {
+        profile_id: String,
+        credential_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -73,6 +80,25 @@ pub trait ProviderPlugin: Send + Sync {
     }
 }
 
+/// Blanket implementation of [`ProviderPlugin`] for [`ProviderDiscoverySpec`].
+///
+/// Providers that only need standard env-var discovery can register their
+/// `SPEC` constant directly, instead of defining a dedicated struct and
+/// repeating the same three-method delegation.
+impl ProviderPlugin for ProviderDiscoverySpec {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn discover_existing(&self) -> Result<Option<DiscoveredProvider>, ProviderError> {
+        discover_with_spec(self, &RealDiscoveryContext)
+    }
+
+    fn credential_env_vars(&self) -> &'static [&'static str] {
+        self.credential_env_vars
+    }
+}
+
 #[derive(Default)]
 pub struct ProviderRegistry {
     plugins: HashMap<&'static str, Box<dyn ProviderPlugin>>,
@@ -82,16 +108,16 @@ impl ProviderRegistry {
     #[must_use]
     pub fn new() -> Self {
         let mut registry = Self::default();
-        registry.register(providers::claude::ClaudeProvider);
-        registry.register(providers::codex::CodexProvider);
-        registry.register(providers::copilot::CopilotProvider);
+        registry.register(providers::claude::SPEC);
+        registry.register(providers::codex::SPEC);
+        registry.register(providers::copilot::SPEC);
         registry.register(providers::opencode::OpencodeProvider);
         registry.register(providers::generic::GenericProvider);
-        registry.register(providers::openai::OpenaiProvider);
-        registry.register(providers::anthropic::AnthropicProvider);
-        registry.register(providers::nvidia::NvidiaProvider);
-        registry.register(providers::gitlab::GitlabProvider);
-        registry.register(providers::github::GithubProvider);
+        registry.register(providers::openai::SPEC);
+        registry.register(providers::anthropic::SPEC);
+        registry.register(providers::nvidia::SPEC);
+        registry.register(providers::gitlab::SPEC);
+        registry.register(providers::github::SPEC);
         registry.register(providers::outlook::OutlookProvider);
         registry
     }

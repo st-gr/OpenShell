@@ -75,6 +75,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Reviewing       | `review-github-pr`        | Summarize PR diffs and key design decisions                                                         |
 | Reviewing       | `review-security-issue`   | Assess security issues for severity and remediation                                                 |
 | Reviewing       | `watch-github-actions`    | Monitor CI pipeline status and logs                                                                 |
+| Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
 | Platform        | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs                                        |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
@@ -124,6 +125,25 @@ Project requirements:
 - Python 3.12+
 - Docker (running)
 - Z3 solver library (for the policy prover crate)
+
+### macOS build tools
+
+Install Apple Command Line Tools before building locally:
+
+```bash
+xcode-select --install
+```
+
+If Cargo fails while building `protobuf-src` with an error such as
+`fatal error: 'utility' file not found`, `fatal error: 'cstdlib' file not
+found`, or `A compiler with support for C++11 language features is required`,
+your Command Line Tools install may not expose the libc++ headers on the
+compiler's default include path. Reinstall Command Line Tools to correct the error:
+
+```bash
+sudo rm -rf /Library/Developer/CommandLineTools
+xcode-select --install
+```
 
 ### Z3 installation
 
@@ -282,4 +302,4 @@ DCO sign-off is separate from cryptographic commit signing. CI requires signing 
 
 ## CI
 
-How E2E runs in CI, the `test:e2e` / `test:e2e-gpu` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).
+How PR CI runs, the `test:e2e` / `test:e2e-gpu` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).

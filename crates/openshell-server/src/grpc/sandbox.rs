@@ -34,7 +34,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -193,7 +193,27 @@ async fn handle_create_sandbox_inner(
             status
         })?;
 
-    let sandbox = state.compute.create_sandbox(sandbox).await?;
+    // Mint the gateway JWT for singleplayer drivers. K8s sandboxes skip
+    // this mint and bootstrap via `IssueSandboxToken` at supervisor
+    // startup; identifying "is this K8s?" lives in the compute layer, so
+    // we mint unconditionally here when the issuer is configured and let
+    // the K8s driver simply ignore the field.
+    let sandbox_token = state.sandbox_jwt_issuer.as_ref().map(|issuer| {
+        issuer.mint(&id).map(|minted| {
+            tracing::info!(
+                sandbox_id = %id,
+                "minted sandbox JWT"
+            );
+            minted.token
+        })
+    });
+    let sandbox_token = match sandbox_token {
+        Some(Ok(token)) => Some(token),
+        Some(Err(status)) => return Err(status),
+        None => None,
+    };
+
+    let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
 
     info!(
         sandbox_id = %id,
@@ -824,29 +844,10 @@ pub(super) async fn handle_exec_sandbox(
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
         // Wait for the supervisor's reverse CONNECT to deliver the relay stream.
-        let relay_stream = match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx)
-            .await
-        {
-            Ok(Ok(Ok(stream))) => stream,
-            Ok(Ok(Err(status))) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "ExecSandbox: relay target open failed");
-                let _ = tx.send(Err(status)).await;
-                return;
-            }
-            Ok(Err(_)) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ExecSandbox: relay channel dropped");
-                let _ = tx
-                    .send(Err(Status::unavailable("relay channel dropped")))
-                    .await;
-                return;
-            }
-            Err(_) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ExecSandbox: relay open timed out");
-                let _ = tx
-                    .send(Err(Status::deadline_exceeded("relay open timed out")))
-                    .await;
-                return;
-            }
+        let Some(relay_stream) =
+            await_relay_stream(relay_rx, &tx, &sandbox_id, &channel_id, "ExecSandbox").await
+        else {
+            return;
         };
 
         if let Err(err) = stream_exec_over_relay(
@@ -867,6 +868,41 @@ pub(super) async fn handle_exec_sandbox(
     });
 
     Ok(Response::new(ReceiverStream::new(rx)))
+}
+
+/// Wait for the supervisor's reverse CONNECT to deliver a relay stream.
+///
+/// Returns `Some(stream)` on success. On any failure the error is sent on `tx`
+/// and `None` is returned; the caller should then `return` immediately.
+async fn await_relay_stream<T: Send + 'static>(
+    relay_rx: oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+    tx: &mpsc::Sender<Result<T, Status>>,
+    sandbox_id: &str,
+    channel_id: &str,
+    context: &str,
+) -> Option<tokio::io::DuplexStream> {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx).await {
+        Ok(Ok(Ok(stream))) => Some(stream),
+        Ok(Ok(Err(status))) => {
+            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "{context}: relay target open failed");
+            let _ = tx.send(Err(status)).await;
+            None
+        }
+        Ok(Err(_)) => {
+            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "{context}: relay channel dropped");
+            let _ = tx
+                .send(Err(Status::unavailable("relay channel dropped")))
+                .await;
+            None
+        }
+        Err(_) => {
+            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "{context}: relay open timed out");
+            let _ = tx
+                .send(Err(Status::deadline_exceeded("relay open timed out")))
+                .await;
+            None
+        }
+    }
 }
 
 pub(super) async fn handle_forward_tcp(
@@ -918,29 +954,10 @@ pub(super) async fn handle_forward_tcp(
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
     tokio::spawn(async move {
         let _connection_guard = connection_guard;
-        let relay_stream = match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx)
-            .await
-        {
-            Ok(Ok(Ok(stream))) => stream,
-            Ok(Ok(Err(status))) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "ForwardTcp: relay target open failed");
-                let _ = tx.send(Err(status)).await;
-                return;
-            }
-            Ok(Err(_)) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ForwardTcp: relay channel dropped");
-                let _ = tx
-                    .send(Err(Status::unavailable("relay channel dropped")))
-                    .await;
-                return;
-            }
-            Err(_) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ForwardTcp: relay open timed out");
-                let _ = tx
-                    .send(Err(Status::deadline_exceeded("relay open timed out")))
-                    .await;
-                return;
-            }
+        let Some(relay_stream) =
+            await_relay_stream(relay_rx, &tx, &sandbox_id, &channel_id, "ForwardTcp").await
+        else {
+            return;
         };
 
         bridge_forward_tcp_stream(inbound, relay_stream, tx, &sandbox_id, &channel_id).await;
@@ -1266,29 +1283,16 @@ pub(super) async fn handle_exec_sandbox_interactive(
 
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
-        let relay_stream = match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx)
-            .await
-        {
-            Ok(Ok(Ok(stream))) => stream,
-            Ok(Ok(Err(status))) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "ExecSandboxInteractive: relay target open failed");
-                let _ = tx.send(Err(status)).await;
-                return;
-            }
-            Ok(Err(_)) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ExecSandboxInteractive: relay channel dropped");
-                let _ = tx
-                    .send(Err(Status::unavailable("relay channel dropped")))
-                    .await;
-                return;
-            }
-            Err(_) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ExecSandboxInteractive: relay open timed out");
-                let _ = tx
-                    .send(Err(Status::deadline_exceeded("relay open timed out")))
-                    .await;
-                return;
-            }
+        let Some(relay_stream) = await_relay_stream(
+            relay_rx,
+            &tx,
+            &sandbox_id,
+            &channel_id,
+            "ExecSandboxInteractive",
+        )
+        .await
+        else {
+            return;
         };
 
         if let Err(err) = stream_interactive_exec_over_relay(

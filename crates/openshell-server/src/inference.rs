@@ -59,8 +59,13 @@ impl ObjectType for InferenceRoute {
 impl Inference for InferenceService {
     async fn get_inference_bundle(
         &self,
-        _request: Request<GetInferenceBundleRequest>,
+        request: Request<GetInferenceBundleRequest>,
     ) -> Result<Response<GetInferenceBundleResponse>, Status> {
+        authorize_inference_bundle(
+            request
+                .extensions()
+                .get::<crate::auth::principal::Principal>(),
+        )?;
         resolve_inference_bundle(self.state.store.as_ref())
             .await
             .map(Response::new)
@@ -401,6 +406,20 @@ fn find_provider_config_value(provider: &Provider, preferred_keys: &[&str]) -> O
     None
 }
 
+fn authorize_inference_bundle(
+    principal: Option<&crate::auth::principal::Principal>,
+) -> Result<(), Status> {
+    match principal {
+        Some(crate::auth::principal::Principal::Sandbox(_)) => Ok(()),
+        Some(crate::auth::principal::Principal::User(_)) => Err(Status::permission_denied(
+            "GetInferenceBundle requires a sandbox principal",
+        )),
+        Some(crate::auth::principal::Principal::Anonymous) | None => Err(Status::unauthenticated(
+            "GetInferenceBundle requires an authenticated sandbox principal",
+        )),
+    }
+}
+
 /// Resolve the inference bundle (all managed routes + revision hash).
 async fn resolve_inference_bundle(store: &Store) -> Result<GetInferenceBundleResponse, Status> {
     let mut routes = Vec::new();
@@ -498,9 +517,41 @@ async fn resolve_route_by_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::identity::{Identity, IdentityProvider};
+    use crate::auth::principal::{
+        Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
+    };
     use openshell_core::ObjectId;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn test_store() -> Store {
+        Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("in-memory SQLite store should connect")
+    }
+
+    fn test_user_principal() -> Principal {
+        Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: "user-a".to_string(),
+                display_name: None,
+                roles: vec!["openshell-user".to_string()],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        })
+    }
+
+    fn test_sandbox_principal() -> Principal {
+        Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: "sandbox-a".to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        })
+    }
 
     fn make_route(name: &str, provider_name: &str, model_id: &str) -> InferenceRoute {
         InferenceRoute {
@@ -550,11 +601,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn inference_bundle_requires_sandbox_principal() {
+        let sandbox = test_sandbox_principal();
+        assert!(authorize_inference_bundle(Some(&sandbox)).is_ok());
+
+        let user = test_user_principal();
+        let err = authorize_inference_bundle(Some(&user)).expect_err("users cannot fetch bundle");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let err = authorize_inference_bundle(None).expect_err("missing principal rejected");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
     #[tokio::test]
     async fn upsert_cluster_route_creates_and_increments_version() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store should connect");
+        let store = test_store().await;
 
         let provider = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-test");
         store
@@ -593,9 +655,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_managed_route_returns_none_when_missing() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store should connect");
+        let store = test_store().await;
 
         let route = resolve_route_by_name(&store, CLUSTER_INFERENCE_ROUTE_NAME)
             .await
@@ -605,9 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn bundle_happy_path_returns_managed_route() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store");
+        let store = test_store().await;
 
         let provider = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-test");
         store
@@ -634,9 +692,7 @@ mod tests {
 
     #[tokio::test]
     async fn bundle_without_cluster_route_returns_empty_routes() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store");
+        let store = test_store().await;
 
         let resp = resolve_inference_bundle(&store)
             .await
@@ -646,9 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn bundle_revision_is_stable_for_same_route() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store");
+        let store = test_store().await;
 
         let provider = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-test");
         store
@@ -678,9 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_managed_route_derives_from_provider() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store should connect");
+        let store = test_store().await;
 
         let provider = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -746,9 +798,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_managed_route_reflects_provider_key_rotation() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store should connect");
+        let store = test_store().await;
 
         let provider = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-initial");
         store
@@ -790,9 +840,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_system_route_creates_with_correct_name() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store");
+        let store = test_store().await;
 
         let provider = make_provider("anthropic-dev", "anthropic", "ANTHROPIC_API_KEY", "sk-ant");
         store.put_message(&provider).await.expect("persist");
@@ -816,9 +864,7 @@ mod tests {
 
     #[tokio::test]
     async fn bundle_includes_both_user_and_system_routes() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store");
+        let store = test_store().await;
 
         let openai = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-oai");
         store.put_message(&openai).await.expect("persist openai");
@@ -856,9 +902,7 @@ mod tests {
 
     #[tokio::test]
     async fn bundle_with_only_system_route() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store");
+        let store = test_store().await;
 
         let provider = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-test");
         store.put_message(&provider).await.expect("persist");
@@ -876,9 +920,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_returns_system_route_when_requested() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store");
+        let store = test_store().await;
 
         let provider = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-test");
         store.put_message(&provider).await.expect("persist");
@@ -907,9 +949,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_cluster_route_verifies_endpoint_when_requested() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store");
+        let store = test_store().await;
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -960,9 +1000,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_cluster_route_rejects_failed_validation() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store");
+        let store = test_store().await;
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -1013,9 +1051,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_cluster_route_skips_validation_by_default() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store");
+        let store = test_store().await;
         let provider = make_provider_with_base_url(
             "openai-dev",
             "openai",
@@ -1076,9 +1112,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_upsert_route_create_uses_must_create() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store");
+        let store = test_store().await;
 
         let provider = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-test");
         store.put_message(&provider).await.expect("persist");
@@ -1113,7 +1147,9 @@ mod tests {
         let result1 = handle1.await.unwrap();
         let result2 = handle2.await.unwrap();
 
-        // One should succeed with MustCreate, the other should fail
+        // If both tasks observe a missing route before either insert commits, MustCreate
+        // should let exactly one win. If the scheduler serializes them, the second call
+        // may legitimately observe the new route and take the update path.
         let successes = [&result1, &result2].iter().filter(|r| r.is_ok()).count();
         let failures = [&result1, &result2]
             .iter()
@@ -1127,29 +1163,45 @@ mod tests {
             })
             .count();
 
-        assert_eq!(
-            successes, 1,
-            "exactly one create should succeed, got: {result1:?}, {result2:?}"
+        assert!(
+            successes == 1 || successes == 2,
+            "one racing create should succeed, or both serialized upserts should succeed, got: {result1:?}, {result2:?}"
         );
-        assert_eq!(
-            failures, 1,
-            "exactly one create should fail, got: {result1:?}, {result2:?}"
-        );
+        if successes == 1 {
+            assert_eq!(
+                failures, 1,
+                "the losing racing create should fail, got: {result1:?}, {result2:?}"
+            );
+        } else {
+            assert_eq!(
+                failures, 0,
+                "serialized upserts should not fail, got: {result1:?}, {result2:?}"
+            );
+            let mut versions = [&result1, &result2]
+                .into_iter()
+                .map(|result| result.as_ref().expect("success").route.version)
+                .collect::<Vec<_>>();
+            versions.sort_unstable();
+            assert_eq!(
+                versions,
+                vec![1, 2],
+                "serialized create-then-update should return versions 1 and 2"
+            );
+        }
 
-        // Only one route should exist
+        // Only one route should exist.
         let route = store
             .get_message_by_name::<InferenceRoute>(CLUSTER_INFERENCE_ROUTE_NAME)
             .await
             .expect("fetch")
             .expect("route should exist");
-        assert_eq!(route.version, 1);
+        let expected_version = if successes == 1 { 1 } else { 2 };
+        assert_eq!(route.version, expected_version);
     }
 
     #[tokio::test]
     async fn concurrent_upsert_route_update_uses_cas() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("store");
+        let store = test_store().await;
 
         let provider = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-test");
         store.put_message(&provider).await.expect("persist");

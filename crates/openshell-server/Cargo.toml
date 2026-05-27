@@ -82,13 +82,15 @@ uuid = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }
 jsonwebtoken = { workspace = true }
+async-trait = "0.1"
+url = { workspace = true }
 hex = "0.4"
 russh = "0.57"
 rand = { workspace = true }
 petname = "2"
 ipnet = "2"
 tempfile = "3"
-nix = { workspace = true }
+rustix = { workspace = true }
 x509-parser = "0.16"
 
 [features]

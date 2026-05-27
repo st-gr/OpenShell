@@ -7,6 +7,7 @@ use std::str::FromStr;
 
 /// Default Podman bridge network name.
 pub const DEFAULT_NETWORK_NAME: &str = "openshell";
+pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
 
 /// Image pull policy for sandbox and supervisor images.
 ///
@@ -106,6 +107,10 @@ pub struct PodmanComputeConfig {
     pub guest_tls_cert: Option<PathBuf>,
     /// Host path to the client private key for sandbox mTLS.
     pub guest_tls_key: Option<PathBuf>,
+    /// Container cgroup PID limit for Podman-managed sandboxes.
+    ///
+    /// Set to `0` to leave Podman's runtime/default PID limit unchanged.
+    pub sandbox_pids_limit: i64,
 }
 
 impl PodmanComputeConfig {
@@ -149,6 +154,16 @@ impl PodmanComputeConfig {
         )))
     }
 
+    /// Validate runtime resource-limit configuration.
+    pub fn validate_runtime_limits(&self) -> Result<(), crate::client::PodmanApiError> {
+        if self.sandbox_pids_limit < 0 {
+            return Err(crate::client::PodmanApiError::InvalidInput(
+                "sandbox_pids_limit must be zero or greater".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Resolve the default socket path from the environment.
     ///
     /// - **macOS**: `$HOME/.local/share/containers/podman/machine/podman.sock`
@@ -167,7 +182,7 @@ impl PodmanComputeConfig {
         {
             std::env::var("XDG_RUNTIME_DIR").map_or_else(
                 |_| {
-                    let uid = nix::unistd::getuid();
+                    let uid = rustix::process::getuid().as_raw();
                     PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
                 },
                 |xdg| PathBuf::from(xdg).join("podman/podman.sock"),
@@ -180,7 +195,7 @@ impl Default for PodmanComputeConfig {
     fn default() -> Self {
         Self {
             socket_path: Self::default_socket_path(),
-            default_image: default_sandbox_image(),
+            default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
@@ -191,15 +206,9 @@ impl Default for PodmanComputeConfig {
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
+            sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
         }
     }
-}
-
-fn default_sandbox_image() -> String {
-    format!(
-        "{}/base:latest",
-        openshell_core::image::DEFAULT_COMMUNITY_REGISTRY
-    )
 }
 
 impl std::fmt::Debug for PodmanComputeConfig {
@@ -217,6 +226,7 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("guest_tls_ca", &self.guest_tls_ca)
             .field("guest_tls_cert", &self.guest_tls_cert)
             .field("guest_tls_key", &self.guest_tls_key)
+            .field("sandbox_pids_limit", &self.sandbox_pids_limit)
             .finish()
     }
 }
@@ -250,12 +260,29 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         temp_env::with_vars([("XDG_RUNTIME_DIR", None::<&str>)], || {
             let path = PodmanComputeConfig::default_socket_path();
-            let uid = nix::unistd::getuid();
+            let uid = rustix::process::getuid().as_raw();
             assert_eq!(
                 path,
                 PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
             );
         });
+    }
+
+    #[test]
+    fn default_config_sets_driver_owned_pids_limit() {
+        let cfg = PodmanComputeConfig::default();
+        assert_eq!(cfg.sandbox_pids_limit, DEFAULT_SANDBOX_PIDS_LIMIT);
+        assert!(cfg.validate_runtime_limits().is_ok());
+    }
+
+    #[test]
+    fn runtime_limit_validation_rejects_negative_pids_limit() {
+        let cfg = PodmanComputeConfig {
+            sandbox_pids_limit: -1,
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_runtime_limits().unwrap_err();
+        assert!(err.to_string().contains("sandbox_pids_limit"));
     }
 
     #[test]

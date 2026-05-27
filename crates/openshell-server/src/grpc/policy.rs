@@ -10,9 +10,10 @@
 #![allow(clippy::cast_precision_loss)] // f64->f32 for confidence scores
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
+use crate::ServerState;
+use crate::auth::principal::Principal;
 use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store};
 use crate::policy_store::PolicyStoreExt;
-use crate::{ServerState, auth::oidc};
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -369,8 +370,12 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
     }
 }
 
+#[cfg(test)]
 fn is_sandbox_caller<T>(request: &Request<T>) -> bool {
-    oidc::is_sandbox_caller(request.metadata())
+    matches!(
+        request.extensions().get::<Principal>(),
+        Some(Principal::Sandbox(_))
+    )
 }
 
 /// Sandbox-class callers may only perform sandbox-scoped policy sync. They
@@ -399,6 +404,41 @@ fn validate_sandbox_caller_update(req: &UpdateConfigRequest) -> Result<(), Statu
     Ok(())
 }
 
+async fn resolve_sandbox_by_name_for_principal(
+    store: &Store,
+    principal: &Principal,
+    name: &str,
+) -> Result<Sandbox, Status> {
+    let sandbox = store
+        .get_message_by_name::<Sandbox>(name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
+
+    match principal {
+        Principal::Sandbox(_) => {
+            let Some(sandbox) = sandbox else {
+                return Err(Status::permission_denied(
+                    "sandbox not found or not owned by caller",
+                ));
+            };
+            crate::auth::guard::ensure_sandbox_scope(principal, sandbox.object_id()).map_err(
+                |status| {
+                    if status.code() == tonic::Code::PermissionDenied {
+                        Status::permission_denied("sandbox not found or not owned by caller")
+                    } else {
+                        status
+                    }
+                },
+            )?;
+            Ok(sandbox)
+        }
+        Principal::User(_) => sandbox.ok_or_else(|| Status::not_found("sandbox not found")),
+        Principal::Anonymous => Err(Status::unauthenticated(
+            "sandbox-scoped methods require an authenticated caller",
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Config handlers
 // ---------------------------------------------------------------------------
@@ -407,7 +447,9 @@ pub(super) async fn handle_get_sandbox_config(
     state: &Arc<ServerState>,
     request: Request<GetSandboxConfigRequest>,
 ) -> Result<Response<GetSandboxConfigResponse>, Status> {
-    let sandbox_id = request.into_inner().sandbox_id;
+    let sandbox_id = request.get_ref().sandbox_id.clone();
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    drop(request);
 
     let sandbox = state
         .store
@@ -670,7 +712,9 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     state: &Arc<ServerState>,
     request: Request<GetSandboxProviderEnvironmentRequest>,
 ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
-    let sandbox_id = request.into_inner().sandbox_id;
+    let sandbox_id = request.get_ref().sandbox_id.clone();
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    drop(request);
 
     let sandbox = state
         .store
@@ -713,11 +757,12 @@ pub(super) async fn handle_update_config(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
-    let sandbox_caller = is_sandbox_caller(&request);
+    let principal = request.extensions().get::<Principal>().cloned();
+    let sandbox_caller = matches!(principal, Some(Principal::Sandbox(_)));
     let update = request.get_ref();
     let should_emit_policy_failure = should_emit_config_update_policy_telemetry(sandbox_caller)
         && (update.policy.is_some() || !update.merge_operations.is_empty());
-    let result = handle_update_config_inner(state, request).await;
+    let result = handle_update_config_inner(state, request, principal, sandbox_caller).await;
     if result.is_err() && should_emit_policy_failure {
         emit_sandbox_policy_update_failure();
     }
@@ -727,11 +772,20 @@ pub(super) async fn handle_update_config(
 async fn handle_update_config_inner(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
+    principal: Option<Principal>,
+    sandbox_caller: bool,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
-    let sandbox_caller = is_sandbox_caller(&request);
     let req = request.into_inner();
     if sandbox_caller {
         validate_sandbox_caller_update(&req)?;
+        resolve_sandbox_by_name_for_principal(
+            state.store.as_ref(),
+            principal
+                .as_ref()
+                .expect("sandbox_caller implies principal"),
+            &req.name,
+        )
+        .await?;
     }
     let key = req.setting_key.trim();
     let has_policy = req.policy.is_some();
@@ -1256,6 +1310,8 @@ pub(super) async fn handle_report_policy_status(
     state: &Arc<ServerState>,
     request: Request<ReportPolicyStatusRequest>,
 ) -> Result<Response<ReportPolicyStatusResponse>, Status> {
+    let sandbox_id = request.get_ref().sandbox_id.clone();
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     let req = request.into_inner();
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
@@ -1378,8 +1434,13 @@ pub(super) async fn handle_push_sandbox_logs(
     state: &Arc<ServerState>,
     request: Request<tonic::Streaming<PushSandboxLogsRequest>>,
 ) -> Result<Response<PushSandboxLogsResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let mut stream = request.into_inner();
-    let mut validated = false;
+    let mut validated_sandbox_id = None;
 
     while let Some(batch) = stream
         .message()
@@ -1390,15 +1451,13 @@ pub(super) async fn handle_push_sandbox_logs(
             continue;
         }
 
-        if !validated {
-            state
-                .store
-                .get_message::<Sandbox>(&batch.sandbox_id)
-                .await
-                .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-                .ok_or_else(|| Status::not_found("sandbox not found"))?;
-            validated = true;
-        }
+        ensure_log_stream_sandbox_scope(
+            state,
+            &principal,
+            &batch.sandbox_id,
+            &mut validated_sandbox_id,
+        )
+        .await?;
 
         for log in batch.logs.into_iter().take(100) {
             let mut log = log;
@@ -1411,6 +1470,32 @@ pub(super) async fn handle_push_sandbox_logs(
     Ok(Response::new(PushSandboxLogsResponse {}))
 }
 
+async fn ensure_log_stream_sandbox_scope(
+    state: &Arc<ServerState>,
+    principal: &Principal,
+    sandbox_id: &str,
+    validated_sandbox_id: &mut Option<String>,
+) -> Result<(), Status> {
+    if let Some(validated) = validated_sandbox_id.as_deref() {
+        if sandbox_id != validated {
+            return Err(Status::permission_denied(
+                "log stream sandbox_id changed after validation",
+            ));
+        }
+        return Ok(());
+    }
+
+    crate::auth::guard::ensure_sandbox_scope(principal, sandbox_id)?;
+    state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    *validated_sandbox_id = Some(sandbox_id.to_string());
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Draft policy recommendation handlers
 // ---------------------------------------------------------------------------
@@ -1419,17 +1504,18 @@ pub(super) async fn handle_submit_policy_analysis(
     state: &Arc<ServerState>,
     request: Request<SubmitPolicyAnalysisRequest>,
 ) -> Result<Response<SubmitPolicyAnalysisResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let req = request.into_inner();
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
 
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&req.name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox =
+        resolve_sandbox_by_name_for_principal(state.store.as_ref(), &principal, &req.name).await?;
     let sandbox_id = sandbox.object_id().to_string();
     for summary in &req.network_activity_summaries {
         state
@@ -1563,17 +1649,18 @@ pub(super) async fn handle_get_draft_policy(
     state: &Arc<ServerState>,
     request: Request<GetDraftPolicyRequest>,
 ) -> Result<Response<GetDraftPolicyResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let req = request.into_inner();
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
 
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&req.name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox =
+        resolve_sandbox_by_name_for_principal(state.store.as_ref(), &principal, &req.name).await?;
     let sandbox_id = sandbox.object_id().to_string();
 
     let status_filter = if req.status_filter.is_empty() {
@@ -2971,10 +3058,54 @@ fn materialize_global_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::identity::{Identity, IdentityProvider};
+    use crate::auth::principal::{
+        Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
+    };
     use crate::grpc::test_support::test_server_state;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tonic::Code;
+
+    async fn test_store() -> Store {
+        Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("in-memory SQLite store should connect")
+    }
+
+    /// Wrap a request with a user `Principal` so handler scope guards treat
+    /// the test caller as a CLI user. Most handler tests exercise
+    /// user-facing behavior and should not trip sandbox equality checks.
+    fn with_user<T>(mut request: Request<T>) -> Request<T> {
+        request
+            .extensions_mut()
+            .insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "test-user".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+        request
+    }
+
+    /// Wrap a request with a sandbox `Principal` bound to `sandbox_id`.
+    /// Use for tests that exercise sandbox-caller code paths.
+    #[allow(dead_code)]
+    fn with_sandbox<T>(mut request: Request<T>, sandbox_id: &str) -> Request<T> {
+        request
+            .extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: sandbox_id.to_string(),
+                source: SandboxIdentitySource::BootstrapJwt {
+                    issuer: "openshell-gateway:test".to_string(),
+                },
+                trust_domain: Some("openshell".to_string()),
+            }));
+        request
+    }
 
     #[test]
     fn sandbox_caller_update_validation_allows_sandbox_policy_sync() {
@@ -3010,12 +3141,17 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_caller_marker_detected_from_metadata() {
+    fn sandbox_caller_detected_from_principal_extension() {
+        use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
         let mut req = Request::new(());
-        req.metadata_mut().insert(
-            oidc::INTERNAL_AUTH_SOURCE_HEADER,
-            oidc::AUTH_SOURCE_SANDBOX.parse().unwrap(),
-        );
+        req.extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: "test-sandbox".to_string(),
+                source: SandboxIdentitySource::BootstrapJwt {
+                    issuer: "openshell-gateway:test".to_string(),
+                },
+                trust_domain: None,
+            }));
         assert!(is_sandbox_caller(&req));
     }
 
@@ -3032,13 +3168,285 @@ mod tests {
         assert!(should_emit_full_policy_update_telemetry(false, 2));
     }
 
+    #[test]
+    fn user_principal_not_treated_as_sandbox_caller() {
+        use crate::auth::identity::{Identity, IdentityProvider};
+        use crate::auth::principal::{Principal, UserPrincipal};
+        let mut req = Request::new(());
+        req.extensions_mut().insert(Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: "alice".to_string(),
+                display_name: None,
+                roles: vec![],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        }));
+        assert!(!is_sandbox_caller(&req));
+    }
+
+    // ---- Sandbox IDOR guard (issue #1354) ----
+
+    #[tokio::test]
+    async fn cross_sandbox_get_sandbox_config_denied() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        let state = test_server_state().await;
+        // Two sandboxes; the caller is principal of A, the request body
+        // references B.
+        for (id, name) in [("sb-a", "sandbox-a"), ("sb-b", "sandbox-b")] {
+            let sandbox = Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                spec: Some(SandboxSpec {
+                    policy: None,
+                    ..Default::default()
+                }),
+                phase: SandboxPhase::Provisioning as i32,
+                ..Default::default()
+            };
+            state.store.put_message(&sandbox).await.unwrap();
+        }
+        let req = with_sandbox(
+            Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-b".to_string(),
+            }),
+            "sb-a",
+        );
+        let err = handle_get_sandbox_config(&state, req)
+            .await
+            .expect_err("cross-sandbox call must be denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn same_sandbox_get_sandbox_config_allowed() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        let state = test_server_state().await;
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-self".to_string(),
+                name: "self".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Provisioning as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+        let req = with_sandbox(
+            Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-self".to_string(),
+            }),
+            "sb-self",
+        );
+        handle_get_sandbox_config(&state, req)
+            .await
+            .expect("matching principal must be allowed");
+    }
+
+    #[tokio::test]
+    async fn cross_sandbox_submit_policy_analysis_denied() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        let state = test_server_state().await;
+        for (id, name) in [("sb-a", "sandbox-a"), ("sb-b", "sandbox-b")] {
+            let sandbox = Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                spec: Some(SandboxSpec {
+                    policy: None,
+                    ..Default::default()
+                }),
+                phase: SandboxPhase::Provisioning as i32,
+                ..Default::default()
+            };
+            state.store.put_message(&sandbox).await.unwrap();
+        }
+        let req = with_sandbox(
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: "sandbox-b".to_string(),
+                ..Default::default()
+            }),
+            "sb-a",
+        );
+        let err = handle_submit_policy_analysis(&state, req)
+            .await
+            .expect_err("cross-sandbox submit must be denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn cross_sandbox_get_draft_policy_denied() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        let state = test_server_state().await;
+        for (id, name) in [("sb-a", "sandbox-a"), ("sb-b", "sandbox-b")] {
+            let sandbox = Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                spec: Some(SandboxSpec {
+                    policy: None,
+                    ..Default::default()
+                }),
+                phase: SandboxPhase::Provisioning as i32,
+                ..Default::default()
+            };
+            state.store.put_message(&sandbox).await.unwrap();
+        }
+        let req = with_sandbox(
+            Request::new(GetDraftPolicyRequest {
+                name: "sandbox-b".to_string(),
+                status_filter: String::new(),
+            }),
+            "sb-a",
+        );
+        let err = handle_get_draft_policy(&state, req)
+            .await
+            .expect_err("cross-sandbox draft read must be denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn sandbox_update_config_missing_name_returns_permission_denied() {
+        let state = test_server_state().await;
+        let req = with_sandbox(
+            Request::new(UpdateConfigRequest {
+                name: "missing-sandbox".to_string(),
+                policy: Some(ProtoSandboxPolicy::default()),
+                ..Default::default()
+            }),
+            "sb-a",
+        );
+
+        let err = handle_update_config(&state, req)
+            .await
+            .expect_err("missing name must not leak existence to sandbox callers");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn sandbox_submit_policy_analysis_missing_name_returns_permission_denied() {
+        let state = test_server_state().await;
+        let req = with_sandbox(
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: "missing-sandbox".to_string(),
+                ..Default::default()
+            }),
+            "sb-a",
+        );
+
+        let err = handle_submit_policy_analysis(&state, req)
+            .await
+            .expect_err("missing name must not leak existence to sandbox callers");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn sandbox_get_draft_policy_missing_name_returns_permission_denied() {
+        let state = test_server_state().await;
+        let req = with_sandbox(
+            Request::new(GetDraftPolicyRequest {
+                name: "missing-sandbox".to_string(),
+                status_filter: String::new(),
+            }),
+            "sb-a",
+        );
+
+        let err = handle_get_draft_policy(&state, req)
+            .await
+            .expect_err("missing name must not leak existence to sandbox callers");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn user_principal_can_read_any_sandbox_config() {
+        // RBAC was the user gate; the IDOR guard must NOT trip for users.
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        let state = test_server_state().await;
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-x".to_string(),
+                name: "x".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Provisioning as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+        let req = with_user(Request::new(GetSandboxConfigRequest {
+            sandbox_id: "sb-x".to_string(),
+        }));
+        handle_get_sandbox_config(&state, req)
+            .await
+            .expect("user principal must succeed");
+    }
+
+    #[tokio::test]
+    async fn log_stream_scope_rejects_sandbox_id_change_after_validation() {
+        let state = test_server_state().await;
+        for id in ["sb-a", "sb-b"] {
+            let sandbox = test_sandbox(id, id, ProtoSandboxPolicy::default(), vec![]);
+            state.store.put_message(&sandbox).await.unwrap();
+        }
+        let req = with_sandbox(Request::new(()), "sb-a");
+        let principal = req.extensions().get::<Principal>().unwrap().clone();
+        let mut validated = None;
+
+        ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut validated)
+            .await
+            .expect("first frame should validate");
+        let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-b", &mut validated)
+            .await
+            .expect_err("later frame must not switch sandbox ids");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn log_stream_scope_rejects_missing_sandbox() {
+        let state = test_server_state().await;
+        let req = with_sandbox(Request::new(()), "sb-a");
+        let principal = req.extensions().get::<Principal>().unwrap().clone();
+        let mut validated = None;
+
+        let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut validated)
+            .await
+            .expect_err("missing sandbox must not validate");
+
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
     // ---- Sandbox without policy ----
 
     #[tokio::test]
     async fn sandbox_without_policy_stores_successfully() {
         use openshell_core::proto::{SandboxPhase, SandboxSpec};
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
 
         let sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -3145,9 +3553,9 @@ mod tests {
     async fn get_sandbox_policy(state: &Arc<ServerState>, sandbox_id: &str) -> ProtoSandboxPolicy {
         handle_get_sandbox_config(
             state,
-            Request::new(GetSandboxConfigRequest {
+            with_user(Request::new(GetSandboxConfigRequest {
                 sandbox_id: sandbox_id.to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3158,7 +3566,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_policy_layers_skip_unknown_provider_types() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         store
             .put_message(&test_provider("custom-provider", "custom"))
             .await
@@ -3173,7 +3581,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_policy_layers_skip_custom_profile_for_legacy_provider_type() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         store
             .put_message(&test_provider("custom-provider", "generic"))
             .await
@@ -3200,6 +3608,7 @@ mod tests {
                     }],
                     binaries: Vec::new(),
                     inference_capable: false,
+                    discovery: None,
                 }),
             })
             .await
@@ -3215,7 +3624,7 @@ mod tests {
     #[tokio::test]
     #[allow(deprecated)]
     async fn provider_policy_layers_include_custom_provider_profiles() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         store
             .put_message(&test_provider("work-custom", "custom-api"))
             .await
@@ -3256,6 +3665,7 @@ mod tests {
                         harness: true,
                     }],
                     inference_capable: false,
+                    discovery: None,
                 }),
             })
             .await
@@ -3278,7 +3688,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_policy_layers_normalize_custom_provider_type_ids() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         store
             .put_message(&test_provider("work-custom", " Custom-API "))
             .await
@@ -3305,6 +3715,7 @@ mod tests {
                     }],
                     binaries: Vec::new(),
                     inference_capable: false,
+                    discovery: None,
                 }),
             })
             .await
@@ -3320,7 +3731,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_policy_layers_include_known_provider_profiles() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         store
             .put_message(&test_provider("work-github", "github"))
             .await
@@ -3332,13 +3743,30 @@ mod tests {
 
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].rule_name, "_provider_work_github");
-        assert_eq!(layers[0].rule.endpoints.len(), 2);
+        assert_eq!(layers[0].rule.endpoints.len(), 3);
         assert!(
             layers[0]
                 .rule
                 .endpoints
                 .iter()
                 .any(|endpoint| endpoint.host == "api.github.com")
+        );
+        assert!(
+            layers[0].rule.endpoints.iter().any(|endpoint| {
+                endpoint.host == "api.github.com"
+                    && endpoint.protocol == "graphql"
+                    && endpoint.path == "/graphql"
+                    && endpoint.access == "read-only"
+            }),
+            "github provider policy should include read-only GraphQL endpoint"
+        );
+        assert!(
+            layers[0]
+                .rule
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.access == "read-only"),
+            "github provider policy should be read-only by default"
         );
     }
 
@@ -3588,9 +4016,9 @@ mod tests {
 
         let legacy_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-env".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3600,9 +4028,9 @@ mod tests {
         enable_providers_v2(&state).await;
         let v2_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-env".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3634,9 +4062,9 @@ mod tests {
 
         let first = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-revision".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3650,9 +4078,9 @@ mod tests {
 
         let second = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-revision".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3704,9 +4132,9 @@ mod tests {
         );
         let baseline_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3714,11 +4142,11 @@ mod tests {
 
         handle_attach_sandbox_provider(
             &state,
-            Request::new(AttachSandboxProviderRequest {
+            with_user(Request::new(AttachSandboxProviderRequest {
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
-            }),
+            })),
         )
         .await
         .unwrap();
@@ -3732,9 +4160,9 @@ mod tests {
 
         let attached_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3768,9 +4196,9 @@ mod tests {
 
         let detached_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3834,6 +4262,7 @@ mod tests {
                             harness: true,
                         }],
                         inference_capable: false,
+                        discovery: None,
                     }),
                 }],
             }),
@@ -3864,9 +4293,9 @@ mod tests {
         );
         let baseline_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-custom-attach-lifecycle".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3874,11 +4303,11 @@ mod tests {
 
         handle_attach_sandbox_provider(
             &state,
-            Request::new(AttachSandboxProviderRequest {
+            with_user(Request::new(AttachSandboxProviderRequest {
                 sandbox_name: "custom-attach-lifecycle".to_string(),
                 provider_name: "work-custom".to_string(),
                 expected_resource_version: 0,
-            }),
+            })),
         )
         .await
         .unwrap();
@@ -3895,9 +4324,9 @@ mod tests {
 
         let attached_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-custom-attach-lifecycle".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3930,9 +4359,9 @@ mod tests {
         );
         let detached_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-custom-attach-lifecycle".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4030,9 +4459,9 @@ mod tests {
 
         let response = handle_get_sandbox_config(
             &state,
-            Request::new(GetSandboxConfigRequest {
+            with_user(Request::new(GetSandboxConfigRequest {
                 sandbox_id: "sb-global-profile".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4061,7 +4490,7 @@ mod tests {
     async fn sandbox_policy_backfill_on_update_when_no_baseline() {
         use openshell_core::proto::{FilesystemPolicy, LandlockPolicy, SandboxPhase, SandboxSpec};
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
 
         let sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -4158,7 +4587,7 @@ mod tests {
 
         let submit = handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_example".to_string(),
@@ -4172,7 +4601,7 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4184,10 +4613,10 @@ mod tests {
 
         let draft_policy = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name.clone(),
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4254,10 +4683,10 @@ mod tests {
 
         let draft_policy_after_undo = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name.clone(),
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4306,10 +4735,10 @@ mod tests {
 
         let draft_policy_after_clear = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name.clone(),
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4368,7 +4797,7 @@ mod tests {
 
         let submit = handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_example".to_string(),
@@ -4377,7 +4806,7 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4398,10 +4827,10 @@ mod tests {
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4477,7 +4906,7 @@ mod tests {
             async move {
                 handle_submit_policy_analysis(
                     &state,
-                    Request::new(SubmitPolicyAnalysisRequest {
+                    with_user(Request::new(SubmitPolicyAnalysisRequest {
                         name: sandbox_name,
                         analysis_mode: "agent_authored".to_string(),
                         proposed_chunks: vec![PolicyChunk {
@@ -4486,7 +4915,7 @@ mod tests {
                             ..Default::default()
                         }],
                         ..Default::default()
-                    }),
+                    })),
                 )
                 .await
                 .unwrap()
@@ -4506,10 +4935,10 @@ mod tests {
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name.clone(),
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4584,7 +5013,7 @@ mod tests {
             async move {
                 handle_submit_policy_analysis(
                     &state,
-                    Request::new(SubmitPolicyAnalysisRequest {
+                    with_user(Request::new(SubmitPolicyAnalysisRequest {
                         name: sandbox_name,
                         analysis_mode: "mechanistic".to_string(),
                         proposed_chunks: vec![PolicyChunk {
@@ -4593,7 +5022,7 @@ mod tests {
                             ..Default::default()
                         }],
                         ..Default::default()
-                    }),
+                    })),
                 )
                 .await
                 .unwrap()
@@ -4607,10 +5036,10 @@ mod tests {
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4680,7 +5109,7 @@ mod tests {
 
         let submit = handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_example".to_string(),
@@ -4688,7 +5117,7 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4728,10 +5157,10 @@ mod tests {
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4802,7 +5231,7 @@ mod tests {
 
         handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_a.object_name().to_string(),
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_example".to_string(),
@@ -4816,17 +5245,17 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();
 
         let draft_policy = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_a.object_name().to_string(),
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -5021,7 +5450,7 @@ mod tests {
     async fn merge_chunk_into_policy_adds_first_network_rule_to_empty_policy() {
         use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let rule = NetworkPolicyRule {
             name: "google".to_string(),
             endpoints: vec![NetworkEndpoint {
@@ -5084,7 +5513,7 @@ mod tests {
             NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
         };
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let sandbox_id = "sb-merge";
 
         let initial_policy = SandboxPolicy {
@@ -5185,7 +5614,7 @@ mod tests {
             NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
         };
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let sandbox_id = "sb-new";
 
         let initial_policy = SandboxPolicy {
@@ -5272,7 +5701,7 @@ mod tests {
             L7Allow, L7DenyRule, L7Rule, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
         };
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let sandbox_id = "sb-concurrent-merge";
 
         let initial_policy = SandboxPolicy {
@@ -5843,9 +6272,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_settings_load_returns_default_when_empty() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
         let settings = load_global_settings(&store).await.unwrap();
         assert!(settings.settings.is_empty());
         assert_eq!(settings.revision, 0);
@@ -5853,9 +6280,7 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_settings_load_returns_default_when_empty() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
         let settings = load_sandbox_settings(&store, "nonexistent").await.unwrap();
         assert!(settings.settings.is_empty());
         assert_eq!(settings.revision, 0);
@@ -5863,9 +6288,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_settings_save_and_load_round_trip() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let mut settings = StoredSettings::default();
         settings.settings.insert(
@@ -5892,9 +6315,7 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_settings_save_and_load_round_trip() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let sandbox_name = "my-sandbox";
         let mut settings = StoredSettings::default();
@@ -5916,11 +6337,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_global_setting_mutations_are_serialized() {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(test_store().await);
         let mutex = Arc::new(tokio::sync::Mutex::new(()));
 
         let n = 50;
@@ -5951,11 +6368,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_global_setting_mutations_without_lock_can_lose_writes() {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(test_store().await);
 
         let n = 50;
         let mut handles = Vec::with_capacity(n);
@@ -6022,9 +6435,7 @@ mod tests {
 
     #[tokio::test]
     async fn conflict_guard_sandbox_set_blocked_when_global_exists() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let mut global = StoredSettings::default();
         global.settings.insert(
@@ -6041,9 +6452,7 @@ mod tests {
 
     #[tokio::test]
     async fn conflict_guard_sandbox_delete_blocked_when_global_exists() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let mut global = StoredSettings::default();
         global
@@ -6058,9 +6467,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_unlock_sandbox_set_succeeds_after_global_delete() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         // Create initial global settings
         let mut global = StoredSettings::default();
@@ -6122,7 +6529,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_settings_detects_concurrent_modification() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
 
         // Create initial settings
         let mut settings = StoredSettings {

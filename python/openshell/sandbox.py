@@ -153,7 +153,12 @@ class SandboxClient:
             / cluster_name
             / "metadata.json"
         )
-        metadata = json.loads(metadata_path.read_text())
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except FileNotFoundError:
+            raise SandboxError(f"gateway '{cluster_name}' not found") from None
+        if "gateway_endpoint" not in metadata:
+            raise SandboxError(f"gateway '{cluster_name}' metadata missing endpoint")
         parsed = urlparse(metadata["gateway_endpoint"])
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -167,8 +172,17 @@ class SandboxClient:
                 cert_path=mtls_dir / "tls.crt",
                 key_path=mtls_dir / "tls.key",
             )
-            return cls(endpoint, tls=tls, timeout=timeout, cluster_name=cluster_name)
-        return cls(endpoint, timeout=timeout, cluster_name=cluster_name)
+            return cls(
+                endpoint,
+                tls=tls,
+                timeout=timeout,
+                cluster_name=cluster_name,
+            )
+        return cls(
+            endpoint,
+            timeout=timeout,
+            cluster_name=cluster_name,
+        )
 
     def close(self) -> None:
         self._channel.close()
@@ -604,7 +618,10 @@ def _resolve_active_cluster() -> str:
     if env_gateway:
         return env_gateway
     active_file = _xdg_config_home() / "openshell" / "active_gateway"
-    value = active_file.read_text().strip()
+    try:
+        value = active_file.read_text().strip()
+    except FileNotFoundError:
+        raise SandboxError("no active gateway configured") from None
     if value == "":
         raise SandboxError("no active gateway configured")
     return value

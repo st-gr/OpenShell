@@ -122,9 +122,9 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
 
 /// Apply authentication token from local storage based on gateway auth mode.
 ///
-/// Handles both Cloudflare Access (`edge_token`) and OIDC (`oidc_token`)
-/// auth modes by loading the stored token and setting it on `TlsOptions`.
-/// For OIDC, automatically refreshes the token if it's near expiry.
+/// Handles Cloudflare Access and OIDC auth modes by loading the stored token
+/// and setting it on `TlsOptions`. For OIDC, automatically refreshes the token
+/// if it's near expiry.
 fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
     let Some(meta) = get_gateway_metadata(gateway_name) else {
         return;
@@ -141,11 +141,14 @@ fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
                 return;
             };
             if openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
+                let insecure = std::env::var("OPENSHELL_GATEWAY_INSECURE")
+                    .is_ok_and(|v| !v.is_empty() && v != "0" && v != "false");
                 // Try to refresh the token in-place using block_in_place
                 // so the async refresh can run within the sync apply_auth call.
                 match tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(openshell_cli::oidc_auth::oidc_refresh_token(&bundle))
+                    tokio::runtime::Handle::current().block_on(
+                        openshell_cli::oidc_auth::oidc_refresh_token(&bundle, insecure),
+                    )
                 }) {
                     Ok(refreshed) => {
                         let _ = openshell_bootstrap::oidc_token::store_oidc_token(
@@ -181,7 +184,7 @@ fn resolve_sandbox_name(name: Option<String>, gateway: &str) -> Result<String> {
     let last = load_last_sandbox(gateway).ok_or_else(|| {
         miette::miette!(
             "No sandbox name provided and no last-used sandbox.\n\
-             Specify a sandbox name or connect to one first: nav sandbox connect <name>"
+             Specify a sandbox name or connect to one first: openshell sandbox connect <name>"
         )
     })?;
     eprintln!("{} Using sandbox '{}' (last used)", "→".bold(), last.bold());
@@ -681,6 +684,21 @@ impl OutputFormat {
 }
 
 #[derive(Clone, Debug, ValueEnum)]
+enum PolicyGetOutput {
+    Table,
+    Json,
+}
+
+impl PolicyGetOutput {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Clone, Debug, ValueEnum)]
 enum CliEditor {
     Vscode,
     Cursor,
@@ -1039,7 +1057,11 @@ enum GatewayCommands {
     /// Prints a table of all registered gateways with their endpoint, type,
     /// and authentication mode. The active gateway is marked with `*`.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    List,
+    List {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
 }
 
 // -----------------------------------------------------------------------
@@ -1134,7 +1156,7 @@ enum SandboxCommands {
         #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Sandbox source: a community sandbox name (e.g., `openclaw`), a path
+        /// Sandbox source: a community sandbox name (e.g., `ollama`), a path
         /// to a Dockerfile or directory containing one, or a full container
         /// image reference (e.g., `myregistry.com/img:tag`).
         ///
@@ -1587,9 +1609,13 @@ enum PolicyCommands {
         #[arg(long = "rev", default_value_t = 0)]
         rev: u32,
 
-        /// Print the full policy as YAML.
+        /// Include the full policy payload.
         #[arg(long)]
         full: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = PolicyGetOutput::Table)]
+        output: PolicyGetOutput,
 
         /// Show the global policy revision.
         #[arg(long)]
@@ -1894,6 +1920,7 @@ async fn main() -> Result<()> {
                     &oidc_client_id,
                     oidc_audience.as_deref(),
                     oidc_scopes.as_deref(),
+                    cli.gateway_insecure,
                 )
                 .await?;
             }
@@ -1919,7 +1946,7 @@ async fn main() -> Result<()> {
                              Or set one with: openshell gateway select <name>"
                         )
                     })?;
-                run::gateway_login(&name).await?;
+                run::gateway_login(&name, cli.gateway_insecure).await?;
             }
             GatewayCommands::Logout { name } => {
                 let name = name
@@ -1942,8 +1969,8 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| "openshell".to_string());
                 run::gateway_admin_info(&name)?;
             }
-            GatewayCommands::List => {
-                run::gateway_list(&cli.gateway)?;
+            GatewayCommands::List { output } => {
+                run::gateway_list(&cli.gateway, output.as_str())?;
             }
         },
 
@@ -2267,13 +2294,29 @@ async fn main() -> Result<()> {
                     name,
                     rev,
                     full,
+                    output,
                     global,
                 } => {
                     if global {
-                        run::sandbox_policy_get_global(&ctx.endpoint, rev, full, &tls).await?;
+                        run::sandbox_policy_get_global(
+                            &ctx.endpoint,
+                            rev,
+                            full,
+                            output.as_str(),
+                            &tls,
+                        )
+                        .await?;
                     } else {
                         let name = resolve_sandbox_name(name, &ctx.name)?;
-                        run::sandbox_policy_get(&ctx.endpoint, &name, rev, full, &tls).await?;
+                        run::sandbox_policy_get(
+                            &ctx.endpoint,
+                            &name,
+                            rev,
+                            full,
+                            output.as_str(),
+                            &tls,
+                        )
+                        .await?;
                     }
                 }
                 PolicyCommands::List {
@@ -3439,7 +3482,7 @@ mod tests {
             let err = resolve_sandbox_name(None, "unknown-gateway").unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("nav sandbox connect"),
+                msg.contains("openshell sandbox connect"),
                 "expected helpful hint in error, got: {msg}"
             );
         });
@@ -3687,6 +3730,51 @@ mod tests {
     }
 
     #[test]
+    fn gateway_list_default_output_is_table() {
+        let cli = Cli::try_parse_from(["openshell", "gateway", "list"])
+            .expect("gateway list should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::List {
+                    output: OutputFormat::Table,
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn gateway_list_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "gateway", "list", "-o", "json"])
+            .expect("gateway list -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::List {
+                    output: OutputFormat::Json,
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn gateway_list_accepts_output_yaml() {
+        let cli = Cli::try_parse_from(["openshell", "gateway", "list", "-o", "yaml"])
+            .expect("gateway list -o yaml should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::List {
+                    output: OutputFormat::Yaml,
+                })
+            })
+        ));
+    }
+
+    #[test]
     fn provider_create_accepts_custom_profile_type_ids() {
         let cli = Cli::try_parse_from([
             "openshell",
@@ -3916,6 +4004,34 @@ mod tests {
                 assert!(name.is_none());
             }
             other => panic!("expected settings get command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_get_json_output_parses() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "policy",
+            "get",
+            "my-sandbox",
+            "--full",
+            "-o",
+            "json",
+        ])
+        .expect("policy get -o json should parse");
+
+        match cli.command {
+            Some(Commands::Policy {
+                command:
+                    Some(PolicyCommands::Get {
+                        name, full, output, ..
+                    }),
+            }) => {
+                assert_eq!(name.as_deref(), Some("my-sandbox"));
+                assert!(full);
+                assert!(matches!(output, PolicyGetOutput::Json));
+            }
+            other => panic!("expected policy get command, got: {other:?}"),
         }
     }
 

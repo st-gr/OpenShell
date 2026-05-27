@@ -20,10 +20,11 @@ use openshell_core::proto::{
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
-    ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
-    ProviderResponse, RelayFrame, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    SandboxResponse, SandboxStreamEvent, ServiceStatus, SupervisorMessage, TcpForwardFrame,
-    UpdateProviderRequest, WatchSandboxRequest,
+    IssueSandboxTokenRequest, IssueSandboxTokenResponse, ListProvidersRequest,
+    ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ProviderResponse,
+    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RelayFrame, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, ServiceStatus,
+    SupervisorMessage, TcpForwardFrame, UpdateProviderRequest, WatchSandboxRequest,
     open_shell_server::{OpenShell, OpenShellServer},
 };
 use openshell_server::{MultiplexedService, TlsAcceptor, health_router};
@@ -420,6 +421,20 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn issue_sandbox_token(
+        &self,
+        _request: tonic::Request<IssueSandboxTokenRequest>,
+    ) -> Result<Response<IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn refresh_sandbox_token(
+        &self,
+        _request: tonic::Request<RefreshSandboxTokenRequest>,
+    ) -> Result<Response<RefreshSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn connect_supervisor(
         &self,
         _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
@@ -556,4 +571,42 @@ pub async fn start_test_server(
     });
 
     (addr, handle)
+}
+
+/// Rogue PKI bundle: client cert + key not signed by the server's CA.
+pub struct RoguePkiBundle {
+    pub client_cert_pem: String,
+    pub client_key_pem: String,
+}
+
+/// Generate a rogue CA and a client certificate signed by that CA.
+///
+/// Used to verify that the server rejects mTLS connections from clients whose
+/// certificate chain does not trace back to the trusted CA.
+pub fn generate_rogue_pki() -> RoguePkiBundle {
+    let mut rogue_ca_params =
+        CertificateParams::new(Vec::<String>::new()).expect("failed to create rogue CA params");
+    rogue_ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    rogue_ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "rogue-ca");
+    let rogue_ca_key = KeyPair::generate().expect("failed to generate rogue CA key");
+    let rogue_ca_cert = rogue_ca_params
+        .self_signed(&rogue_ca_key)
+        .expect("failed to sign rogue CA cert");
+
+    let mut rogue_client_params =
+        CertificateParams::new(Vec::<String>::new()).expect("failed to create rogue client params");
+    rogue_client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "rogue-client");
+    let rogue_client_key = KeyPair::generate().expect("failed to generate rogue client key");
+    let rogue_client_cert = rogue_client_params
+        .signed_by(&rogue_client_key, &rogue_ca_cert, &rogue_ca_key)
+        .expect("failed to sign rogue client cert");
+
+    RoguePkiBundle {
+        client_cert_pem: rogue_client_cert.pem(),
+        client_key_pem: rogue_client_key.serialize_pem(),
+    }
 }

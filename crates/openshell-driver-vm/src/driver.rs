@@ -100,6 +100,7 @@ const GUEST_SSH_SOCKET_PATH: &str = "/run/openshell/ssh.sock";
 const GUEST_TLS_CA_PATH: &str = "/opt/openshell/tls/ca.crt";
 const GUEST_TLS_CERT_PATH: &str = "/opt/openshell/tls/tls.crt";
 const GUEST_TLS_KEY_PATH: &str = "/opt/openshell/tls/tls.key";
+const GUEST_SANDBOX_TOKEN_PATH: &str = "/opt/openshell/auth/sandbox.jwt";
 const IMAGE_CACHE_ROOT_DIR: &str = "images";
 const IMAGE_CACHE_ROOTFS_IMAGE: &str = "rootfs.ext4";
 const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";
@@ -595,7 +596,16 @@ impl VmDriver {
             ),
         );
         if let Err(err) = self
-            .prepare_runtime_overlay(&overlay_disk, tls_paths.as_ref(), overlay_preparation)
+            .prepare_runtime_overlay(
+                &overlay_disk,
+                tls_paths.as_ref(),
+                sandbox
+                    .spec
+                    .as_ref()
+                    .map(|spec| spec.sandbox_token.as_str())
+                    .filter(|token| !token.is_empty()),
+                overlay_preparation,
+            )
             .await
         {
             return Err(Status::internal(format!(
@@ -1190,12 +1200,14 @@ impl VmDriver {
         &self,
         overlay_disk: &Path,
         tls_paths: Option<&VmDriverTlsPaths>,
+        sandbox_token: Option<&str>,
         preparation: OverlayPreparation,
     ) -> Result<(), String> {
         let tls_materials = match tls_paths {
             Some(paths) => Some(read_guest_tls_materials(paths).await?),
             None => None,
         };
+        let sandbox_token = sandbox_token.map(str::to_string);
         let overlay_disk = overlay_disk.to_path_buf();
         let overlay_size_bytes = self
             .config
@@ -1224,6 +1236,7 @@ impl VmDriver {
                 &template_path,
                 &overlay_disk,
                 tls_materials.as_ref(),
+                sandbox_token.as_deref(),
                 preparation,
                 overlay_size_bytes,
             )
@@ -2549,9 +2562,8 @@ impl ComputeDriver for VmDriver {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)] // libc::geteuid is a thin syscall wrapper
 fn check_gpu_privileges() -> Result<(), String> {
-    if unsafe { libc::geteuid() } != 0 {
+    if !rustix::process::geteuid().is_root() {
         return Err(
             "GPU support requires root privileges for VFIO bind/unbind and TAP networking. \
              Run with sudo or ensure CAP_SYS_ADMIN + CAP_NET_ADMIN capabilities are set."
@@ -3494,6 +3506,18 @@ fn build_guest_environment(
         ]));
     }
     environment.extend(merged_environment(sandbox));
+    environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
+    environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    if sandbox
+        .spec
+        .as_ref()
+        .is_some_and(|spec| !spec.sandbox_token.is_empty())
+    {
+        environment.insert(
+            openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.to_string(),
+            GUEST_SANDBOX_TOKEN_PATH.to_string(),
+        );
+    }
     environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
@@ -3925,10 +3949,14 @@ fn create_sandbox_overlay_image_from_template(
     template_path: &Path,
     overlay_disk: &Path,
     tls_materials: Option<&GuestTlsMaterials>,
+    sandbox_token: Option<&str>,
 ) -> Result<(), String> {
     clone_or_copy_sparse_file(template_path, overlay_disk)?;
     if let Some(tls) = tls_materials {
         inject_guest_tls_materials(overlay_disk, tls)?;
+    }
+    if let Some(token) = sandbox_token {
+        inject_guest_sandbox_token(overlay_disk, token)?;
     }
     Ok(())
 }
@@ -3937,6 +3965,7 @@ fn prepare_sandbox_overlay_image(
     template_path: &Path,
     overlay_disk: &Path,
     tls_materials: Option<&GuestTlsMaterials>,
+    sandbox_token: Option<&str>,
     preparation: OverlayPreparation,
     expected_size_bytes: u64,
 ) -> Result<(), String> {
@@ -3945,6 +3974,9 @@ fn prepare_sandbox_overlay_image(
             Ok(metadata) if metadata.is_file() && metadata.len() == expected_size_bytes => {
                 if let Some(tls) = tls_materials {
                     inject_guest_tls_materials(overlay_disk, tls)?;
+                }
+                if let Some(token) = sandbox_token {
+                    inject_guest_sandbox_token(overlay_disk, token)?;
                 }
                 return Ok(());
             }
@@ -3972,7 +4004,12 @@ fn prepare_sandbox_overlay_image(
         }
     }
 
-    create_sandbox_overlay_image_from_template(template_path, overlay_disk, tls_materials)
+    create_sandbox_overlay_image_from_template(
+        template_path,
+        overlay_disk,
+        tls_materials,
+        sandbox_token,
+    )
 }
 
 fn inject_guest_tls_materials(
@@ -3992,6 +4029,12 @@ fn inject_guest_tls_materials(
     let key_path = overlay_upper_path(GUEST_TLS_KEY_PATH);
     write_rootfs_image_file(overlay_disk, &key_path, &materials.key)?;
     set_rootfs_image_file_mode(overlay_disk, &key_path, 0o600)
+}
+
+fn inject_guest_sandbox_token(overlay_disk: &Path, token: &str) -> Result<(), String> {
+    let token_path = overlay_upper_path(GUEST_SANDBOX_TOKEN_PATH);
+    write_rootfs_image_file(overlay_disk, &token_path, format!("{token}\n").as_bytes())?;
+    set_rootfs_image_file_mode(overlay_disk, &token_path, 0o600)
 }
 
 fn overlay_upper_path(guest_path: &str) -> String {
@@ -4703,6 +4746,7 @@ mod tests {
             &template,
             &overlay,
             None,
+            None,
             OverlayPreparation::PreserveExisting,
             "saved-overlay".len() as u64,
         )
@@ -4724,6 +4768,7 @@ mod tests {
         prepare_sandbox_overlay_image(
             &template,
             &overlay,
+            None,
             None,
             OverlayPreparation::PreserveExisting,
             "fresh-overlay".len() as u64,
@@ -5014,6 +5059,38 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn build_guest_environment_uses_token_file_without_raw_token_env() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                sandbox_token: "secret.jwt.value".to_string(),
+                environment: HashMap::from([(
+                    openshell_core::sandbox_env::SANDBOX_TOKEN.to_string(),
+                    "user-provided-token".to_string(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+
+        assert!(!env.iter().any(|v| v.starts_with(&format!(
+            "{}=",
+            openshell_core::sandbox_env::SANDBOX_TOKEN
+        ))));
+        assert!(env.contains(&format!(
+            "{}={GUEST_SANDBOX_TOKEN_PATH}",
+            openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
+        )));
     }
 
     #[test]
