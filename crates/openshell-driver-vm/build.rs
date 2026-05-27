@@ -6,6 +6,7 @@
 //! This crate embeds the sandbox supervisor plus the minimal libkrun runtime
 //! artifacts it needs to boot VMs without a separate VM runtime binary.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
@@ -43,6 +44,27 @@ fn main() {
             return;
         }
     };
+
+    let supervisor_path = env::var_os("CARGO_BIN_FILE_OPENSHELL_SANDBOX")
+        .or_else(|| env::var_os("CARGO_BIN_FILE_OPENSHELL_SANDBOX_openshell-sandbox"))
+        .expect("CARGO_BIN_FILE_OPENSHELL_SANDBOX not set");
+    let supervisor_path = PathBuf::from(supervisor_path);
+    println!("cargo:rerun-if-changed={}", supervisor_path.display());
+
+    let mut supervisor = File::open(&supervisor_path)
+        .unwrap_or_else(|e| panic!("Failed to open {}: {e}", supervisor_path.display()));
+    let dst_path = out_dir.join("openshell-sandbox.zst");
+    let mut dst = File::create(&dst_path)
+        .unwrap_or_else(|e| panic!("Failed to create {}: {e}", dst_path.display()));
+    zstd::stream::copy_encode(&mut supervisor, &mut dst, 1).unwrap_or_else(|e| {
+        panic!(
+            "Failed to compress {} to {}: {e}",
+            supervisor_path.display(),
+            dst_path.display()
+        )
+    });
+    let size = fs::metadata(&dst_path).map_or(0, |m| m.len());
+    println!("cargo:warning=Embedded openshell-sandbox.zst: {size} bytes");
 
     let compressed_dir = if let Ok(dir) = env::var("OPENSHELL_VM_RUNTIME_COMPRESSED_DIR") {
         PathBuf::from(dir)
@@ -88,10 +110,6 @@ fn main() {
             format!("{libkrunfw_name}.zst"),
         ),
         ("gvproxy.zst".to_string(), "gvproxy.zst".to_string()),
-        (
-            "openshell-sandbox.zst".to_string(),
-            "openshell-sandbox.zst".to_string(),
-        ),
         ("umoci.zst".to_string(), "umoci.zst".to_string()),
     ];
 
