@@ -20,7 +20,7 @@ lockfile_platforms = ["linux-x64", "linux-arm64", "macos-arm64"]
 
 [tools]
 python = "3.14.5"
-rust = "1.95.0"
+rust = "nightly-2026-05-27"
 node = "24.15.0"
 kubectl = "1.36.1"
 uv = "0.10.12"
