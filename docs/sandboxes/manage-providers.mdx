@@ -254,11 +254,21 @@ openshell provider create \
   --passthrough SLACK_SIGNING_SECRET
 ```
 
-`--passthrough` is repeatable, and the same flag is available on `openshell provider update`. Each key must exist in the resolved provider credentials — supplied via `--credential`, discovered through `--from-existing`, or, on `update`, already stored against the provider.
+`--passthrough` is repeatable, and the same flag is available on `openshell provider update`. Each key must exist in the resolved provider credentials — supplied via `--credential`, discovered through `--from-existing`, or, on `update`, already stored against the provider. On `update`, a non-empty `--passthrough KEY ...` list replaces the existing list verbatim; an empty list (i.e. omitting the flag) preserves the stored list and prunes any entries whose credential was deleted in the same update.
 
 <Warning>
 Passthrough drops the "agent never sees the real secret" invariant for the listed keys. The real value sits in `/proc/<agent-pid>/environ` and any descendant process inherits it. Use it only when the consumer demonstrably fails with the canonical placeholder — prefer the placeholder model whenever the consumer permits it.
 </Warning>
+
+### Revoking passthrough
+
+To revoke passthrough for every credential on a provider in one operation, use `--clear-passthrough` on `openshell provider update`:
+
+```shell
+openshell provider update --name slack --clear-passthrough
+```
+
+`--clear-passthrough` is mutually exclusive with `--passthrough` because passing both would be ambiguous (the server cannot honour "clear and then set" in one request — issue two updates instead). After the update the agent process receives canonical placeholders for every credential again, and any new sandbox launched against the provider picks up the revoked status on the next environment refresh.
 
 `openshell provider get <name>` annotates passthrough keys in its output, and `openshell provider list` shows a `PASSTHROUGH` column with the per-provider count.
 

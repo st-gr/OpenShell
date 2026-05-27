@@ -950,6 +950,8 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         &["API_KEY=rotated".to_string()],
         &["profile=prod".to_string()],
         &[],
+        false,
+        &[],
         &ts.tls,
     )
     .await
@@ -1417,7 +1419,7 @@ async fn provider_update_from_existing_uses_profile_discovery_when_v2_enabled() 
     );
     let _env = EnvVarGuard::set(&[("CUSTOM_UPDATE_DISCOVERY_API_KEY", "updated-profile-secret")]);
 
-    run::provider_update(&ts.endpoint, "custom-update", true, &[], &[], &[], &ts.tls)
+    run::provider_update(&ts.endpoint, "custom-update", true, &[], &[], &[], false, &[], &ts.tls)
         .await
         .expect("profile-backed provider update --from-existing");
 

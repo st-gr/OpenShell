@@ -177,6 +177,22 @@ pub(super) async fn update_provider_record(
     store: &Store,
     provider: Provider,
 ) -> Result<Provider, Status> {
+    update_provider_record_inner(store, provider, false).await
+}
+
+pub(super) async fn update_provider_record_with_options(
+    store: &Store,
+    provider: Provider,
+    clear_passthrough_credentials: bool,
+) -> Result<Provider, Status> {
+    update_provider_record_inner(store, provider, clear_passthrough_credentials).await
+}
+
+async fn update_provider_record_inner(
+    store: &Store,
+    provider: Provider,
+    clear_passthrough_credentials: bool,
+) -> Result<Provider, Status> {
     use crate::persistence::{ObjectId, ObjectName};
 
     if provider.object_name().is_empty() {
@@ -221,14 +237,21 @@ pub(super) async fn update_provider_record(
         candidate.credential_expires_at_ms,
         provider.credential_expires_at_ms,
     );
-    // Passthrough merge with orphan pruning: when the caller does not declare a
-    // new passthrough list (empty incoming = preserve), drop any entries whose
-    // credential was deleted in this same update. Without this, deleting a
-    // credential that was marked passthrough leaves the provider in a state
-    // that fails validation, and the operator cannot recover without
-    // recreating the provider. When the caller declares a non-empty list, keep
-    // strict validation — an explicit orphan is a caller bug and must surface.
-    let merged_passthrough = if provider.passthrough_credentials.is_empty() {
+    // Passthrough merge:
+    // - `clear_passthrough_credentials=true` wipes the list to empty, regardless
+    //   of `provider.passthrough_credentials`. This is the only way to revoke
+    //   passthrough for every key, because proto3 cannot distinguish "absent"
+    //   from "empty list" on a repeated field.
+    // - When the caller does not declare a new passthrough list (empty incoming
+    //   = preserve), drop any entries whose credential was deleted in this same
+    //   update. Without this, deleting a credential that was marked passthrough
+    //   leaves the provider in a state that fails validation, and the operator
+    //   cannot recover without recreating the provider.
+    // - When the caller declares a non-empty list, replace verbatim and keep
+    //   strict validation — an explicit orphan is a caller bug and must surface.
+    let merged_passthrough = if clear_passthrough_credentials {
+        Vec::new()
+    } else if provider.passthrough_credentials.is_empty() {
         std::mem::take(&mut candidate.passthrough_credentials)
             .into_iter()
             .filter(|key| candidate.credentials.contains_key(key))
@@ -1127,10 +1150,20 @@ pub(super) async fn handle_update_provider(
     let mut provider = req
         .provider
         .ok_or_else(|| Status::invalid_argument("provider is required"))?;
+    if req.clear_passthrough_credentials && !provider.passthrough_credentials.is_empty() {
+        return Err(Status::invalid_argument(
+            "clear_passthrough_credentials and a non-empty passthrough_credentials list are mutually exclusive",
+        ));
+    }
     provider
         .credential_expires_at_ms
         .extend(req.credential_expires_at_ms);
-    let provider = update_provider_record(state.store.as_ref(), provider).await?;
+    let provider = update_provider_record_with_options(
+        state.store.as_ref(),
+        provider,
+        req.clear_passthrough_credentials,
+    )
+    .await?;
 
     Ok(Response::new(ProviderResponse {
         provider: Some(provider),
@@ -3452,6 +3485,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_provider_clear_passthrough_credentials_wipes_list() {
+        // `clear_passthrough_credentials=true` revokes passthrough for every
+        // credential. The proto3 repeated field cannot distinguish "absent"
+        // from "empty list", so without this flag an empty incoming list is
+        // preserved.
+        let store = test_store().await;
+
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack-clear".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "slack".to_string(),
+                credentials: [
+                    ("SLACK_BOT_TOKEN".to_string(), "xoxb".to_string()),
+                    ("SLACK_SIGNING_SECRET".to_string(), "sig".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: vec![
+                    "SLACK_BOT_TOKEN".to_string(),
+                    "SLACK_SIGNING_SECRET".to_string(),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+
+        let cleared = update_provider_record_with_options(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack-clear".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: String::new(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
+            },
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(cleared.passthrough_credentials.is_empty());
+        assert!(cleared.credentials.contains_key("SLACK_BOT_TOKEN"));
+        assert!(cleared.credentials.contains_key("SLACK_SIGNING_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn handle_update_provider_rejects_clear_combined_with_non_empty_passthrough() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack-clear-conflict".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "slack".to_string(),
+                credentials: std::iter::once(("API_KEY".to_string(), "v".to_string())).collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = handle_update_provider(
+            &state,
+            Request::new(UpdateProviderRequest {
+                provider: Some(Provider {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: String::new(),
+                        name: "slack-clear-conflict".to_string(),
+                        created_at_ms: 0,
+                        labels: HashMap::new(),
+                        resource_version: 0,
+                    }),
+                    r#type: String::new(),
+                    credentials: HashMap::new(),
+                    config: HashMap::new(),
+                    credential_expires_at_ms: HashMap::new(),
+                    passthrough_credentials: vec!["API_KEY".to_string()],
+                }),
+                credential_expires_at_ms: HashMap::new(),
+                clear_passthrough_credentials: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("mutually exclusive"));
+    }
+
+    #[tokio::test]
     async fn resolve_provider_env_empty_list_returns_empty() {
         let store = test_store().await;
         let result = resolve_provider_environment(&store, &[]).await.unwrap();
@@ -4134,6 +4280,7 @@ mod tests {
             Request::new(UpdateProviderRequest {
                 provider: Some(updated_provider.clone()),
                 credential_expires_at_ms: HashMap::new(),
+                clear_passthrough_credentials: false,
             }),
         )
         .await
@@ -4202,6 +4349,7 @@ mod tests {
             Request::new(UpdateProviderRequest {
                 provider: Some(stale_provider),
                 credential_expires_at_ms: HashMap::new(),
+                clear_passthrough_credentials: false,
             }),
         )
         .await
@@ -4272,6 +4420,7 @@ mod tests {
                     Request::new(UpdateProviderRequest {
                         provider: Some(updated),
                         credential_expires_at_ms: HashMap::new(),
+                        clear_passthrough_credentials: false,
                     }),
                 )
                 .await

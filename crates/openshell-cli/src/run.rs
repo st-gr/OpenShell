@@ -5032,6 +5032,7 @@ pub async fn provider_update(
     credentials: &[String],
     config: &[String],
     passthrough: &[String],
+    clear_passthrough: bool,
     credential_expires_at: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -5097,6 +5098,7 @@ pub async fn provider_update(
                 passthrough_credentials,
             }),
             credential_expires_at_ms,
+            clear_passthrough_credentials: clear_passthrough,
         })
         .await
         .into_diagnostic()?;
