@@ -31,11 +31,21 @@
         "x86_64-linux"
         "aarch64-darwin"
       ];
+      libkrunDarwinOverlay = import ./nix/overlays/libkrun-darwin.nix;
     in
-    eachSystem systems (
+    {
+      overlays = {
+        libkrun-darwin = libkrunDarwinOverlay;
+        default = libkrunDarwinOverlay;
+      };
+    }
+    // eachSystem systems (
       system:
       let
-        overlays = [ (import rust-overlay) ];
+        overlays = [
+          (import rust-overlay)
+          libkrunDarwinOverlay
+        ];
         pkgs = import nixpkgs {
           inherit overlays system;
         };
@@ -55,6 +65,10 @@
       in
       {
         formatter = treefmt.config.build.wrapper;
+
+        packages = {
+          inherit (pkgs) libkrun libkrunfw;
+        };
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [

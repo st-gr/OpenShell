@@ -47,6 +47,22 @@ OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed \
 Use `FROM_SOURCE=1 mise run vm:setup` to build the runtime from source instead
 of downloading `vm-runtime-<platform>.tar.zst`.
 
+## Nix libkrun Build
+
+On Apple Silicon, the repo flake wires in a local overlay for the VM runtime
+libraries:
+
+```shell
+nix build .#libkrunfw
+nix build .#libkrun
+```
+
+The `libkrun` package builds libkrun from source with `BLK=1 NET=1` and GPU
+support disabled, matching the macOS runtime used by OpenShell. The Darwin
+`libkrunfw` package currently stages the published `vm-runtime` firmware dylib
+because the release does not publish the generated `kernel.c` artifact as a
+stable fixed-output source.
+
 ## CI Ownership
 
 `release-vm-kernel.yml` is the on-demand producer for:
