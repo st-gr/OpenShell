@@ -762,6 +762,23 @@ async fn build_compute_runtime(
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
+        ComputeDriverKind::External(socket) => {
+            info!(
+                socket = %socket.display(),
+                "Connecting to external compute driver over Unix domain socket"
+            );
+            let channel = compute::connect_external_compute_driver(socket.clone()).await?;
+            ComputeRuntime::new_remote_external(
+                channel,
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
     }
 }
 
@@ -853,12 +870,7 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
                 set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
             )),
         },
-        [
-            driver @ (ComputeDriverKind::Kubernetes
-            | ComputeDriverKind::Vm
-            | ComputeDriverKind::Docker
-            | ComputeDriverKind::Podman),
-        ] => Ok(*driver),
+        [driver] => Ok(driver.clone()),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
             drivers
