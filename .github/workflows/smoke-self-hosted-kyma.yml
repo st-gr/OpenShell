@@ -1,0 +1,62 @@
+name: smoke-self-hosted-kyma
+# Verifies the Kyma-hosted self-hosted runner is operational and can
+# reach the in-cluster Anthropic proxy. Triggered manually so it runs
+# only when the operator wants — no surprise cost.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, kyma]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      # Confirm the runner picked up the job (so far so good if you see
+      # this line in the workflow log).
+      - name: Identify runner
+        run: |
+          echo "runner: ${RUNNER_NAME:-unknown}"
+          echo "labels: ${RUNNER_TRACKING_LABELS:-self-hosted,kyma}"
+
+      # Print only the in-cluster base URL — never bare 'env' or
+      # 'printenv', which would dump ANTHROPIC_AUTH_TOKEN into the log.
+      - name: Show ANTHROPIC_BASE_URL
+        run: |
+          if [ -z "${ANTHROPIC_BASE_URL:-}" ]; then
+            echo "ANTHROPIC_BASE_URL is not set on this runner" >&2
+            exit 1
+          fi
+          printenv ANTHROPIC_BASE_URL
+
+      # Hit the proxy. Print only the HTTP status code, never the body
+      # or the auth token. 200/401/403 all confirm reachability and the
+      # in-cluster route works; 502/503/504 indicates the upstream
+      # is degraded; 000 indicates the runner can't reach the Service
+      # at all (probably a NetworkPolicy issue).
+      #
+      # ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL come from the
+      # runner POD env (Kyma Secret + ConfigMap). They are inherited
+      # by the worker process; shell expands them directly. We do
+      # NOT try to surface them through the GitHub Actions expression
+      # context (`${{ env.X }}` would fail because that namespace only
+      # contains workflow-level env, not runner-pod env).
+      - name: Probe your-llm-gateway reachability
+        run: |
+          set +x   # belt-and-braces; do not echo expanded variables
+          if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+            echo "ANTHROPIC_AUTH_TOKEN is not set on this runner" >&2
+            exit 1
+          fi
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "x-api-key: ${ANTHROPIC_AUTH_TOKEN}" \
+            "${ANTHROPIC_BASE_URL%/}/v1/models" || echo "000")
+          echo "proxy reachability: HTTP ${status}"
+          # Anything in 2xx/4xx confirms TCP+TLS+routing work and the
+          # proxy answered. 5xx is upstream degraded but the path is
+          # functional. 000 is local failure.
+          test "${status}" != "000"
+          test "${status:0:1}" != "5" || echo "warn: proxy returned 5xx; routing OK but upstream degraded"
+
+      - name: Done
+        run: echo "smoke complete on Kyma self-hosted runner"
