@@ -660,7 +660,7 @@ fn validate_grpc_rate_limit_args(requests: Option<u64>, window_seconds: Option<u
 fn effective_single_driver(args: &RunArgs) -> Option<ComputeDriverKind> {
     match args.drivers.as_slice() {
         [] => openshell_core::config::detect_driver(),
-        [driver] => Some(*driver),
+        [driver] => Some(driver.clone()),
         _ => None,
     }
 }
