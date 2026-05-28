@@ -22,10 +22,10 @@ FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json -p openshell-server
 COPY . .
-RUN cargo build --release --bin openshell-server \
- && strip target/release/openshell-server
+RUN cargo build --release --bin openshell-gateway \
+ && strip target/release/openshell-gateway
 
 FROM gcr.io/distroless/cc-debian12:nonroot
-COPY --from=builder /app/target/release/openshell-server /usr/local/bin/openshell-server
+COPY --from=builder /app/target/release/openshell-gateway /usr/local/bin/openshell-gateway
 USER 65532:65532
-ENTRYPOINT ["/usr/local/bin/openshell-server"]
+ENTRYPOINT ["/usr/local/bin/openshell-gateway"]
