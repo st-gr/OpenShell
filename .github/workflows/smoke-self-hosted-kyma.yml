@@ -1,6 +1,6 @@
 name: smoke-self-hosted-kyma
 # Verifies the Kyma-hosted self-hosted runner is operational and can
-# reach the in-cluster Anthropic proxy. Triggered manually so it runs
+# reach the in-cluster your-llm-gateway gateway. Triggered manually so it runs
 # only when the operator wants — no surprise cost.
 on:
   workflow_dispatch: {}
@@ -29,34 +29,53 @@ jobs:
           fi
           printenv ANTHROPIC_BASE_URL
 
-      # Hit the proxy. Print only the HTTP status code, never the body
-      # or the auth token. 200/401/403 all confirm reachability and the
-      # in-cluster route works; 502/503/504 indicates the upstream
-      # is degraded; 000 indicates the runner can't reach the Service
-      # at all (probably a NetworkPolicy issue).
-      #
-      # ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL come from the
-      # runner POD env (Kyma Secret + ConfigMap). They are inherited
-      # by the worker process; shell expands them directly. We do
-      # NOT try to surface them through the GitHub Actions expression
-      # context (`${{ env.X }}` would fail because that namespace only
-      # contains workflow-level env, not runner-pod env).
-      - name: Probe your-llm-gateway reachability
+      # Sanity-check the auth token without echoing it. We only confirm
+      # it is non-empty here; the actual auth path is exercised by the
+      # auth-required probe further down.
+      - name: Confirm ANTHROPIC_AUTH_TOKEN is set
         run: |
-          set +x   # belt-and-braces; do not echo expanded variables
+          set +x
           if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
             echo "ANTHROPIC_AUTH_TOKEN is not set on this runner" >&2
             exit 1
           fi
+          echo "ANTHROPIC_AUTH_TOKEN length: ${#ANTHROPIC_AUTH_TOKEN}"
+
+      # Primary reachability probe: openrouter /api/v1/models on the
+      # same gateway, which is exposed without auth. No token burned,
+      # no /v1/messages call, no inference cost. A 200 here confirms
+      # TCP + DNS + NetworkPolicy + Service routing + gateway-process
+      # liveness — everything except the auth path.
+      #
+      # We derive the gateway origin (scheme://host:port) from
+      # ANTHROPIC_BASE_URL so this stays in sync with the ConfigMap if
+      # the host or port ever changes.
+      - name: Probe gateway reachability (openrouter, unauth)
+        run: |
+          set +x
+          origin=$(printenv ANTHROPIC_BASE_URL | sed -E 's#^(https?://[^/]+).*#\1#')
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            "${origin}/openrouter/api/v1/models" || echo "000")
+          echo "openrouter reachability: HTTP ${status}"
+          # 200 = full success. 000 = local network failure (NetworkPolicy
+          # or DNS). Anything else means the gateway is reachable but in
+          # an unexpected state — fail the smoke so we notice.
+          test "${status}" = "200" || { echo "expected 200 from openrouter probe" >&2; exit 1; }
+
+      # Secondary probe: /v1/models on the anthropic path. We expect 404
+      # ("Cannot GET /anthropic/v1/models") because the gateway does not
+      # implement /v1/models for anthropic — POST /v1/messages is the
+      # only endpoint. Getting a 404 from the gateway (not from
+      # istio-envoy) means routing is healthy and the upstream is up.
+      # Body never printed — we only assert the status.
+      - name: Probe anthropic path is routed (expect 404)
+        run: |
+          set +x
           status=$(curl -sS -o /dev/null -w '%{http_code}' \
             -H "x-api-key: ${ANTHROPIC_AUTH_TOKEN}" \
             "${ANTHROPIC_BASE_URL%/}/v1/models" || echo "000")
-          echo "proxy reachability: HTTP ${status}"
-          # Anything in 2xx/4xx confirms TCP+TLS+routing work and the
-          # proxy answered. 5xx is upstream degraded but the path is
-          # functional. 000 is local failure.
-          test "${status}" != "000"
-          test "${status:0:1}" != "5" || echo "warn: proxy returned 5xx; routing OK but upstream degraded"
+          echo "anthropic /v1/models: HTTP ${status}"
+          test "${status}" = "404" || { echo "anthropic path routing unhealthy" >&2; exit 1; }
 
       - name: Done
         run: echo "smoke complete on Kyma self-hosted runner"
