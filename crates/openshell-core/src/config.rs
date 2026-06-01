@@ -40,6 +40,11 @@ pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 
 /// Compute backends the gateway can orchestrate sandboxes through.
+//
+// Note: this enum is NOT Copy because the External variant carries a
+// PathBuf. Upstream's recent change to `Copy + const fn as_str` is
+// reverted here for the same reason — `as_str` takes `&self` and is a
+// non-const fn so the match can dispatch on the boxed variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputeDriverKind {
@@ -47,7 +52,9 @@ pub enum ComputeDriverKind {
     Vm,
     Docker,
     Podman,
-    /// Out-of-process compute driver speaking the gRPC compute_driver.proto contract over a Unix domain socket. The path is supplied by --compute-driver-socket or OPENSHELL_COMPUTE_DRIVER_SOCKET.
+    /// Out-of-process compute driver speaking the gRPC compute_driver.proto
+    /// contract over a Unix domain socket. The path is supplied by
+    /// --compute-driver-socket or OPENSHELL_COMPUTE_DRIVER_SOCKET.
     External(PathBuf),
 }
 

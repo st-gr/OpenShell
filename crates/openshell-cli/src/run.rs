@@ -1693,6 +1693,7 @@ pub async fn sandbox_create(
     tty_override: Option<bool>,
     auto_providers_override: Option<bool>,
     labels: &HashMap<String, String>,
+    approval_mode: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     if editor.is_some() && !command.is_empty() {
@@ -1806,6 +1807,38 @@ pub async fn sandbox_create(
         let _ = save_last_sandbox(gateway, &sandbox_name);
     }
 
+    // Persist `--approval-mode` as a sandbox-scoped setting now that the
+    // sandbox exists. `manual` is the implicit default (no setting needed);
+    // any other value is written so it survives sandbox restarts and can be
+    // flipped later via `openshell settings set <name> proposal_approval_mode`.
+    // If the write fails the sandbox still runs in default `manual` — surface
+    // the recovery command so the user can retry.
+    if approval_mode != "manual" {
+        let setting = parse_cli_setting_value(settings::PROPOSAL_APPROVAL_MODE_KEY, approval_mode)?;
+        match client
+            .update_config(UpdateConfigRequest {
+                name: sandbox_name.clone(),
+                policy: None,
+                setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+                setting_value: Some(setting),
+                delete_setting: false,
+                global: false,
+                merge_operations: vec![],
+                expected_resource_version: 0,
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(status) => {
+                eprintln!(
+                    "{} failed to set approval mode '{approval_mode}' on sandbox '{sandbox_name}': {}\n  retry with: openshell settings set {sandbox_name} proposal_approval_mode {approval_mode}",
+                    "warning:".yellow().bold(),
+                    status.message(),
+                );
+            }
+        }
+    }
+
     // Set up display — interactive terminals get a step-based checklist with
     // spinners; non-interactive (pipes / CI) get timestamped lines.
     let mut display = if interactive {
@@ -1855,11 +1888,11 @@ pub async fn sandbox_create(
         .into_diagnostic()?
         .into_inner();
 
-    let mut last_phase = sandbox.phase;
+    let mut last_phase = sandbox.phase();
     let mut last_error_reason = String::new();
     let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
     // Track whether we have seen a non-Ready phase during the watch.
-    let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready);
+    let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready);
     let provision_timeout = Duration::from_secs(
         std::env::var("OPENSHELL_PROVISION_TIMEOUT")
             .ok()
@@ -1912,8 +1945,8 @@ pub async fn sandbox_create(
         let evt = item.into_diagnostic()?;
         match evt.payload {
             Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(s)) => {
-                let phase = SandboxPhase::try_from(s.phase).unwrap_or(SandboxPhase::Unknown);
-                last_phase = s.phase;
+                let phase = SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown);
+                last_phase = s.phase();
                 if let Some(message) = ready_false_condition_message(s.status.as_ref()) {
                     last_condition_message = Some(message);
                 }
@@ -2474,7 +2507,7 @@ pub async fn sandbox_get(
     };
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
-    println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase));
+    println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase()));
     println!(
         "  {} {}",
         "Resource version:".dimmed(),
@@ -2558,11 +2591,11 @@ pub async fn sandbox_exec_grpc(
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
     // Verify the sandbox is ready before issuing the exec.
-    if SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready) {
         return Err(miette::miette!(
             "sandbox '{}' is not ready (phase: {}); wait for it to reach Ready state",
             name,
-            phase_name(sandbox.phase)
+            phase_name(sandbox.phase())
         ));
     }
 
@@ -2770,11 +2803,11 @@ async fn fetch_ready_sandbox_for_forward(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox '{name}' not found"))?;
 
-    if SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready) {
         return Err(miette::miette!(
             "sandbox '{}' is no longer ready (phase: {}); stopping service forward",
             name,
-            phase_name(sandbox.phase)
+            phase_name(sandbox.phase())
         ));
     }
 
@@ -3218,8 +3251,8 @@ pub async fn sandbox_list(
 
     // Print rows
     for sandbox in sandboxes {
-        let phase = phase_name(sandbox.phase);
-        let phase_colored = match SandboxPhase::try_from(sandbox.phase) {
+        let phase = phase_name(sandbox.phase());
+        let phase_colored = match SandboxPhase::try_from(sandbox.phase()) {
             Ok(SandboxPhase::Ready) => phase.green().to_string(),
             Ok(SandboxPhase::Error) => phase.red().to_string(),
             Ok(SandboxPhase::Provisioning) => phase.yellow().to_string(),
@@ -3247,8 +3280,8 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "labels": labels,
         "resource_version": meta.map_or(0, |m| m.resource_version),
         "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
-        "phase": phase_name(sandbox.phase),
-        "current_policy_version": sandbox.current_policy_version,
+        "phase": phase_name(sandbox.phase()),
+        "current_policy_version": sandbox.current_policy_version(),
     })
 }
 
@@ -5519,7 +5552,23 @@ fn parse_cli_setting_value(key: &str, raw_value: &str) -> Result<SettingValue> {
     })?;
 
     let value = match setting.kind {
-        SettingValueKind::String => setting_value::Value::StringValue(raw_value.to_string()),
+        SettingValueKind::String => {
+            // Reject typos client-side so `openshell settings set ...
+            // proposal_approval_mode autom` errors immediately instead of
+            // round-tripping through the server. The server enforces the
+            // same check independently for non-CLI callers.
+            setting
+                .validate_string_value(raw_value)
+                .map_err(|allowed| {
+                    miette::miette!(
+                        "invalid value '{}' for key '{}'; expected one of: {}",
+                        raw_value,
+                        key,
+                        allowed.join(", ")
+                    )
+                })?;
+            setting_value::Value::StringValue(raw_value.to_string())
+        }
         SettingValueKind::Int => {
             let parsed = raw_value.trim().parse::<i64>().map_err(|_| {
                 miette::miette!(
@@ -6739,6 +6788,13 @@ pub async fn sandbox_draft_get(
                 chunk.security_notes.yellow()
             );
         }
+        if !chunk.validation_result.is_empty() {
+            println!(
+                "  {} {}",
+                "Validation:".dimmed(),
+                chunk.validation_result.cyan()
+            );
+        }
 
         if let Some(ref rule) = chunk.proposed_rule {
             println!("  {} {}", "Endpoints:".dimmed(), format_endpoints(rule));
@@ -7671,8 +7727,6 @@ mod tests {
         let status = SandboxStatus {
             sandbox_name: "gpu".to_string(),
             agent_pod: "gpu-pod".to_string(),
-            agent_fd: String::new(),
-            sandbox_fd: String::new(),
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
                 status: "False".to_string(),
@@ -7680,6 +7734,7 @@ mod tests {
                 message: "Another GPU sandbox may already be using the available GPU.".to_string(),
                 last_transition_time: String::new(),
             }],
+            ..Default::default()
         };
 
         assert_eq!(
@@ -7693,8 +7748,6 @@ mod tests {
         let status = SandboxStatus {
             sandbox_name: "gpu".to_string(),
             agent_pod: "gpu-pod".to_string(),
-            agent_fd: String::new(),
-            sandbox_fd: String::new(),
             conditions: vec![SandboxCondition {
                 r#type: "Scheduled".to_string(),
                 status: "True".to_string(),
@@ -7702,6 +7755,7 @@ mod tests {
                 message: "Sandbox scheduled".to_string(),
                 last_transition_time: String::new(),
             }],
+            ..Default::default()
         };
 
         assert!(ready_false_condition_message(Some(&status)).is_none());
