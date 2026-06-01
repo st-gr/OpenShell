@@ -7,9 +7,17 @@
 ARG RUST_VERSION=1.95.0
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS chef
+# Native build deps a few transitive crates of `openshell-server` need:
+#   - `libclang-dev` for the `bindgen`-using deps (bindgen links libclang.so).
+#   - `libz3-dev`   for `z3-sys` (the OPA / policy-engine path pulls this in;
+#                    the build script `cargo:include` looks for `z3.h`).
+# Both were introduced when upstream rolled in additional policy-engine
+# functionality. Removing either re-surfaces the corresponding build
+# failures.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         protobuf-compiler libprotobuf-dev pkg-config build-essential ca-certificates \
+        libclang-dev libz3-dev \
     && rm -rf /var/lib/apt/lists/*
 RUN cargo install --locked cargo-chef
 WORKDIR /app
