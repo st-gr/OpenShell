@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Rust fmt + clippy lint check on the fork.
+#
+# Mirrors the relevant pieces of upstream's `mise run pre-commit` so we
+# catch the lints NVIDIA's CI would catch, BEFORE force-pushing a PR
+# branch to upstream. Specifically: the workspace Cargo.toml has
+#
+#   [workspace.lints.clippy]
+#   pedantic = "warn"
+#
+# so `cargo clippy --workspace -- -D warnings` escalates pedantic lints
+# (including `doc_markdown`) to errors. Without this workflow, the
+# fork's only Rust-touching CI is `release-gateway.yml` which just runs
+# `docker build` — `cargo build` doesn't enforce lints, only `cargo
+# clippy` does.
+
+name: rust-lint
+
+on:
+  push:
+    branches: [main, 'feat/**']
+    paths:
+      - 'crates/**'
+      - 'proto/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/rust-lint.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # System deps mirror Dockerfile.gateway's chef stage:
+      # - protobuf-compiler / libprotobuf-dev for the proto crates
+      # - pkg-config / build-essential for native build steps
+      # - libclang-dev for transitive bindgen-using deps
+      # - libz3-dev for transitive z3-sys (policy engine path)
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler libprotobuf-dev pkg-config build-essential \
+            libclang-dev libz3-dev
+
+      # Rust version pinned to match upstream's mise.toml `rust = "1.95.0"`
+      # so `[workspace.lints.clippy] pedantic = "warn"` is enforced
+      # identically here and on NVIDIA's CI.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-lint
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+      # The workspace's `[workspace.lints.clippy]` config sets pedantic and
+      # nursery to "warn"; `-D warnings` escalates them to errors. This is
+      # what catches doc_markdown, redundant_clone, etc. — the same lints
+      # that bit us on PR #1703 (`compute_driver.proto` and an env-var name
+      # missing backticks in a doc comment).
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
