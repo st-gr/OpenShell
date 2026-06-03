@@ -222,7 +222,7 @@ impl ComputeDriver for RemoteComputeDriver {
 /// matches the connector convention used by the VM driver — tonic ignores it
 /// once a custom service connector is supplied.
 #[cfg(unix)]
-pub(crate) async fn connect_external_compute_driver(
+pub async fn connect_external_compute_driver(
     socket_path: std::path::PathBuf,
 ) -> Result<Channel, openshell_core::Error> {
     use hyper_util::rt::TokioIo;
@@ -246,7 +246,7 @@ pub(crate) async fn connect_external_compute_driver(
 }
 
 #[cfg(not(unix))]
-pub(crate) async fn connect_external_compute_driver(
+pub async fn connect_external_compute_driver(
     _socket_path: std::path::PathBuf,
 ) -> Result<Channel, openshell_core::Error> {
     Err(openshell_core::Error::config(
