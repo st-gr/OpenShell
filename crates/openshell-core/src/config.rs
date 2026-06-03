@@ -52,9 +52,9 @@ pub enum ComputeDriverKind {
     Vm,
     Docker,
     Podman,
-    /// Out-of-process compute driver speaking the gRPC compute_driver.proto
+    /// Out-of-process compute driver speaking the gRPC `compute_driver.proto`
     /// contract over a Unix domain socket. The path is supplied by
-    /// --compute-driver-socket or OPENSHELL_COMPUTE_DRIVER_SOCKET.
+    /// `--compute-driver-socket` or `OPENSHELL_COMPUTE_DRIVER_SOCKET`.
     External(PathBuf),
 }
 
@@ -74,9 +74,7 @@ impl ComputeDriverKind {
 impl fmt::Display for ComputeDriverKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Kubernetes | Self::Vm | Self::Docker | Self::Podman => {
-                f.write_str(self.as_str())
-            }
+            Self::Kubernetes | Self::Vm | Self::Docker | Self::Podman => f.write_str(self.as_str()),
             Self::External(path) => write!(f, "external:{}", path.display()),
         }
     }
@@ -669,8 +667,7 @@ mod tests {
 
     #[test]
     fn compute_driver_kind_parses_external_with_socket_path() {
-        let parsed: ComputeDriverKind =
-            "external:/var/run/openshell-driver.sock".parse().unwrap();
+        let parsed: ComputeDriverKind = "external:/var/run/openshell-driver.sock".parse().unwrap();
         match parsed {
             ComputeDriverKind::External(path) => {
                 assert_eq!(path, PathBuf::from("/var/run/openshell-driver.sock"));
@@ -843,7 +840,10 @@ mod tests {
     #[test]
     fn compute_driver_kind_rejects_external_with_empty_path() {
         let err = "external:".parse::<ComputeDriverKind>().unwrap_err();
-        assert!(err.contains("non-empty socket path"), "unexpected error: {err}");
+        assert!(
+            err.contains("non-empty socket path"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
