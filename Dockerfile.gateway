@@ -34,6 +34,10 @@ RUN cargo build --release --bin openshell-gateway \
  && strip target/release/openshell-gateway
 
 FROM gcr.io/distroless/cc-debian12:nonroot
+# z3-sys links libz3 dynamically; the prover crate is pulled into
+# openshell-server, so the gateway binary needs libz3.so.4 at runtime.
+# distroless/cc includes glibc + libstdc++ but not libz3 — copy from builder.
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libz3.so.4 /usr/lib/x86_64-linux-gnu/libz3.so.4
 COPY --from=builder /app/target/release/openshell-gateway /usr/local/bin/openshell-gateway
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/openshell-gateway"]
