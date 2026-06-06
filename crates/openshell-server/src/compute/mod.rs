@@ -281,7 +281,7 @@ impl fmt::Debug for ComputeRuntime {
 impl ComputeRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn from_driver(
-        driver_kind: ComputeDriverKind,
+        driver_kind: Option<ComputeDriverKind>,
         driver: SharedComputeDriver,
         shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
         startup_resume: Option<Arc<dyn StartupResume>>,
@@ -302,7 +302,7 @@ impl ComputeRuntime {
             .default_image;
         Ok(Self {
             driver,
-            driver_kind: Some(driver_kind),
+            driver_kind,
             shutdown_cleanup,
             startup_resume,
             _driver_process: driver_process,
@@ -346,7 +346,7 @@ impl ComputeRuntime {
         let startup_resume: Arc<dyn StartupResume> = driver.clone();
         let driver: SharedComputeDriver = driver;
         Self::from_driver(
-            ComputeDriverKind::Docker,
+            Some(ComputeDriverKind::Docker),
             driver,
             Some(shutdown_cleanup),
             Some(startup_resume),
@@ -375,7 +375,7 @@ impl ComputeRuntime {
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(ComputeDriverService::new(driver));
         Self::from_driver(
-            ComputeDriverKind::Kubernetes,
+            Some(ComputeDriverKind::Kubernetes),
             driver,
             None,
             None,
@@ -402,7 +402,7 @@ impl ComputeRuntime {
     ) -> Result<Self, ComputeError> {
         let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
         Self::from_driver(
-            ComputeDriverKind::Vm,
+            Some(ComputeDriverKind::Vm),
             driver,
             None,
             None,
@@ -435,6 +435,7 @@ impl ComputeRuntime {
     ) -> Result<Self, ComputeError> {
         let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
         Self::from_driver(
+            None,
             driver,
             None,
             None,
@@ -463,7 +464,7 @@ impl ComputeRuntime {
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
         Self::from_driver(
-            ComputeDriverKind::Podman,
+            Some(ComputeDriverKind::Podman),
             driver,
             None,
             None,
@@ -486,7 +487,7 @@ impl ComputeRuntime {
 
     #[must_use]
     pub fn driver_kind(&self) -> Option<ComputeDriverKind> {
-        self.driver_kind
+        self.driver_kind.clone()
     }
 
     #[must_use]
@@ -496,7 +497,7 @@ impl ComputeRuntime {
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
         let driver_sandbox =
-            driver_sandbox_from_public(sandbox, self.driver_kind).map_err(|status| *status)?;
+            driver_sandbox_from_public(sandbox, self.driver_kind.clone()).map_err(|status| *status)?;
         self.driver
             .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
                 sandbox: Some(driver_sandbox),
@@ -512,7 +513,7 @@ impl ComputeRuntime {
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
         let mut driver_sandbox =
-            driver_sandbox_from_public(&sandbox, self.driver_kind).map_err(|status| *status)?;
+            driver_sandbox_from_public(&sandbox, self.driver_kind.clone()).map_err(|status| *status)?;
 
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);

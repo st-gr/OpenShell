@@ -705,7 +705,7 @@ async fn build_compute_runtime(
 ) -> Result<ComputeRuntime> {
     let driver = configured_compute_driver(config)?;
     info!(driver = %driver, "Using compute driver");
-    warn_if_kubernetes_sandbox_jwt_expiry_disabled(config, driver);
+    warn_if_kubernetes_sandbox_jwt_expiry_disabled(config, driver.clone());
 
     match driver {
         ComputeDriverKind::Kubernetes => {
