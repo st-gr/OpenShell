@@ -38,6 +38,28 @@ Docker and Podman apply them as runtime limits. Kubernetes applies them as both
 container requests and limits. The VM driver accepts the fields but currently
 ignores them.
 
+Sandbox create also accepts experimental driver-owned config through
+`--driver-config-json`. The value is a JSON object keyed by driver name. The
+gateway forwards only the block for the active driver, so a Kubernetes gateway
+receives the `kubernetes` object from a value such as:
+
+Nested keys inside each driver block use snake_case. The top-level envelope keys
+are driver names, such as `kubernetes`, and are not part of the nested schema.
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","priority_class_name":"batch-low"}}}' \
+  -- claude
+```
+
+Driver config is for fields without a stable public flag. Prefer `--cpu`,
+`--memory`, and `--gpu` for portable resource intent.
+
+For Kubernetes, `pod.runtime_class_name` maps to PodSpec `runtimeClassName`.
+It overrides the gateway's configured default runtime class for that sandbox,
+while a typed `SandboxTemplate.runtime_class_name` value from the API still
+takes precedence.
+
 ## Docker Driver
 
 [Docker](https://www.docker.com/get-started/)-backed sandboxes run as containers on the gateway host. Use Docker for local development, single-machine gateways, and hosts that already use Docker Desktop or Docker Engine.
@@ -122,11 +144,13 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the gateway TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
 | `default_image` | `server.sandboxImage` | Set the default sandbox image. |
 | `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
+| `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image pull secrets to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
 | `grpc_endpoint` | `server.grpcEndpoint` | Set the gateway callback endpoint reachable from sandbox pods. |
 | `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
 | `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Set the supervisor image that provides the `openshell-sandbox` binary. |
 | `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
 | `supervisor_sideload_method` | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
+| `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
 

@@ -4,8 +4,8 @@
 //! Kubernetes compute driver.
 
 use crate::config::{
-    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig,
-    SupervisorSideloadMethod,
+    AppArmorProfile, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,
+    KubernetesComputeConfig, SupervisorSideloadMethod,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
@@ -19,7 +19,7 @@ use openshell_core::driver_utils::{
 };
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
-    mark_progress_active, mark_progress_complete, mark_progress_detail,
+    format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
@@ -28,6 +28,7 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::Duration;
@@ -78,6 +79,47 @@ pub const SANDBOX_KIND: &str = "Sandbox";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const GPU_RESOURCE_QUANTITY: &str = "1";
+
+// This POC treats the selected Struct as a driver-local typed schema. Once the
+// Kubernetes shape stabilizes, these serde structs may move to driver-local
+// protobuf definitions, but the typed decode should stay inside this driver.
+// Do not promote Kubernetes config messages into the public API or gateway
+// translation layer; the RFC boundary is Struct at the gateway, typed config in
+// the selected driver.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct KubernetesSandboxDriverConfig {
+    pod: KubernetesPodDriverConfig,
+    containers: KubernetesDriverContainersConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct KubernetesPodDriverConfig {
+    node_selector: BTreeMap<String, String>,
+    runtime_class_name: String,
+    tolerations: Vec<serde_json::Value>,
+    priority_class_name: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct KubernetesDriverContainersConfig {
+    agent: KubernetesContainerDriverConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct KubernetesContainerDriverConfig {
+    resources: KubernetesContainerResourceConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct KubernetesContainerResourceConfig {
+    requests: BTreeMap<String, String>,
+    limits: BTreeMap<String, String>,
+}
 
 // ---------------------------------------------------------------------------
 // Default workspace persistence (temporary — will be replaced by snapshotting)
@@ -159,12 +201,11 @@ impl KubernetesComputeDriver {
         })
     }
 
-    pub async fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
+    pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
         Ok(openshell_core::driver_utils::build_capabilities_response(
             "kubernetes",
             openshell_core::VERSION,
             &self.config.default_image,
-            self.has_gpu_capacity().await.unwrap_or(false),
         ))
     }
 
@@ -317,6 +358,7 @@ impl KubernetesComputeDriver {
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
             image_pull_policy: &self.config.image_pull_policy,
+            image_pull_secrets: &self.config.image_pull_secrets,
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
@@ -328,7 +370,9 @@ impl KubernetesComputeDriver {
             client_tls_secret_name: &self.config.client_tls_secret_name,
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
+            app_armor_profile: self.config.app_armor_profile.as_ref(),
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
+            default_runtime_class_name: &self.config.default_runtime_class_name,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
         };
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
@@ -724,24 +768,6 @@ fn extract_image_size(message: &str) -> Option<u64> {
     rest[..end].parse().ok()
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-
-    if bytes >= GB {
-        #[allow(clippy::cast_precision_loss)]
-        let gb = bytes as f64 / GB as f64;
-        format!("{gb:.1} GB")
-    } else if bytes >= MB {
-        format!("{} MB", bytes / MB)
-    } else if bytes >= KB {
-        format!("{} KB", bytes / KB)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
 /// Path where the supervisor binary is mounted inside the agent container.
 const SUPERVISOR_MOUNT_PATH: &str = "/opt/openshell/bin";
 
@@ -1046,6 +1072,7 @@ fn default_workspace_volume_claim_templates(storage_size: &str) -> serde_json::V
 struct SandboxPodParams<'a> {
     default_image: &'a str,
     image_pull_policy: &'a str,
+    image_pull_secrets: &'a [String],
     supervisor_image: &'a str,
     supervisor_image_pull_policy: &'a str,
     supervisor_sideload_method: SupervisorSideloadMethod,
@@ -1057,7 +1084,9 @@ struct SandboxPodParams<'a> {
     client_tls_secret_name: &'a str,
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
+    app_armor_profile: Option<&'a AppArmorProfile>,
     workspace_default_storage_size: &'a str,
+    default_runtime_class_name: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
     /// for the bootstrap `IssueSandboxToken` exchange.
     sa_token_ttl_secs: i64,
@@ -1068,6 +1097,7 @@ impl Default for SandboxPodParams<'_> {
         Self {
             default_image: "",
             image_pull_policy: "",
+            image_pull_secrets: &[],
             supervisor_image: "",
             supervisor_image_pull_policy: "",
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
@@ -1079,7 +1109,9 @@ impl Default for SandboxPodParams<'_> {
             client_tls_secret_name: "",
             host_gateway_ip: "",
             enable_user_namespaces: false,
+            app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
+            default_runtime_class_name: "",
             sa_token_ttl_secs: 3600,
         }
     }
@@ -1094,6 +1126,21 @@ fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String,
         );
     }
     env
+}
+
+fn kubernetes_driver_config(template: &SandboxTemplate) -> KubernetesSandboxDriverConfig {
+    let Some(config) = template.driver_config.as_ref() else {
+        return KubernetesSandboxDriverConfig::default();
+    };
+
+    let json = serde_json::Value::Object(proto_struct_to_json_object(config));
+    match serde_json::from_value(json) {
+        Ok(config) => config,
+        Err(err) => {
+            warn!(error = %err, "Ignoring invalid Kubernetes driver_config");
+            KubernetesSandboxDriverConfig::default()
+        }
+    }
 }
 
 fn sandbox_to_k8s_spec(
@@ -1170,6 +1217,8 @@ fn sandbox_template_to_k8s(
     inject_workspace: bool,
     params: &SandboxPodParams<'_>,
 ) -> serde_json::Value {
+    let driver_config = kubernetes_driver_config(template);
+
     let mut metadata = serde_json::Map::new();
     if !template.labels.is_empty() {
         metadata.insert("labels".to_string(), serde_json::json!(template.labels));
@@ -1200,7 +1249,16 @@ fn sandbox_template_to_k8s(
     }
 
     let mut spec = serde_json::Map::new();
-    if let Some(runtime_class) = platform_config_string(template, "runtime_class_name") {
+    let runtime_class_name = platform_config_string(template, "runtime_class_name")
+        .or_else(|| {
+            (!driver_config.pod.runtime_class_name.is_empty())
+                .then(|| driver_config.pod.runtime_class_name.clone())
+        })
+        .or_else(|| {
+            (!params.default_runtime_class_name.is_empty())
+                .then(|| params.default_runtime_class_name.to_string())
+        });
+    if let Some(runtime_class) = runtime_class_name {
         spec.insert(
             "runtimeClassName".to_string(),
             serde_json::json!(runtime_class),
@@ -1212,6 +1270,7 @@ fn sandbox_template_to_k8s(
     if let Some(tolerations) = platform_config_struct(template, "tolerations") {
         spec.insert("tolerations".to_string(), tolerations);
     }
+    apply_pod_driver_config(&mut spec, &driver_config.pod);
 
     // Per-sandbox platform_config.host_users overrides the cluster-wide default.
     let use_user_namespaces = platform_config_bool(template, "host_users")
@@ -1231,6 +1290,14 @@ fn sandbox_template_to_k8s(
         spec.insert(
             "serviceAccountName".to_string(),
             serde_json::json!(params.service_account_name),
+        );
+    }
+
+    let image_pull_secrets = image_pull_secret_refs(params.image_pull_secrets);
+    if !image_pull_secrets.is_empty() {
+        spec.insert(
+            "imagePullSecrets".to_string(),
+            serde_json::Value::Array(image_pull_secrets),
         );
     }
 
@@ -1281,14 +1348,15 @@ fn sandbox_template_to_k8s(
         // for process identity resolution in network policy enforcement.
         capabilities.extend(["SETUID", "SETGID", "DAC_READ_SEARCH"]);
     }
-    container.insert(
-        "securityContext".to_string(),
-        serde_json::json!({
-            "capabilities": {
-                "add": capabilities
-            }
-        }),
-    );
+    let mut security_context = serde_json::json!({
+        "capabilities": {
+            "add": capabilities
+        }
+    });
+    if let Some(profile) = params.app_armor_profile {
+        security_context["appArmorProfile"] = app_armor_profile_to_k8s(profile);
+    }
+    container.insert("securityContext".to_string(), security_context);
 
     // Mount client TLS secret for mTLS to the server, plus the projected
     // ServiceAccount token used to bootstrap the sandbox's gateway JWT
@@ -1314,6 +1382,7 @@ fn sandbox_template_to_k8s(
     if let Some(resources) = container_resources(template, gpu) {
         container.insert("resources".to_string(), resources);
     }
+    apply_agent_driver_resources(&mut container, &driver_config.containers.agent.resources);
     spec.insert(
         "containers".to_string(),
         serde_json::Value::Array(vec![serde_json::Value::Object(container)]),
@@ -1381,6 +1450,102 @@ fn sandbox_template_to_k8s(
     }
 
     result
+}
+
+fn apply_pod_driver_config(
+    spec: &mut serde_json::Map<String, serde_json::Value>,
+    config: &KubernetesPodDriverConfig,
+) {
+    if !config.node_selector.is_empty() {
+        let node_selector = spec
+            .entry("nodeSelector".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        merge_string_map(node_selector, &config.node_selector);
+    }
+
+    if !config.priority_class_name.is_empty() {
+        spec.entry("priorityClassName".to_string())
+            .or_insert_with(|| serde_json::json!(config.priority_class_name));
+    }
+
+    if !config.tolerations.is_empty() {
+        let tolerations = spec
+            .entry("tolerations".to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(existing) = tolerations.as_array_mut() {
+            existing.extend(config.tolerations.iter().cloned());
+        } else {
+            *tolerations = serde_json::Value::Array(config.tolerations.clone());
+        }
+    }
+}
+
+fn apply_agent_driver_resources(
+    container: &mut serde_json::Map<String, serde_json::Value>,
+    resources: &KubernetesContainerResourceConfig,
+) {
+    if resources.requests.is_empty() && resources.limits.is_empty() {
+        return;
+    }
+
+    let target = container
+        .entry("resources".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    apply_resource_quantity_map(target, "requests", &resources.requests);
+    apply_resource_quantity_map(target, "limits", &resources.limits);
+}
+
+fn merge_string_map(target: &mut serde_json::Value, values: &BTreeMap<String, String>) {
+    if !target.is_object() {
+        *target = serde_json::json!({});
+    }
+    let target = target
+        .as_object_mut()
+        .expect("target was converted to object");
+    for (key, value) in values {
+        target
+            .entry(key.clone())
+            .or_insert_with(|| serde_json::json!(value));
+    }
+}
+
+fn apply_resource_quantity_map(
+    target: &mut serde_json::Value,
+    section: &str,
+    values: &BTreeMap<String, String>,
+) {
+    if values.is_empty() {
+        return;
+    }
+    if !target.is_object() {
+        *target = serde_json::json!({});
+    }
+    let target = target
+        .as_object_mut()
+        .expect("target was converted to object");
+    let section_value = target
+        .entry(section.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    merge_string_map(section_value, values);
+}
+
+fn image_pull_secret_refs(secrets: &[String]) -> Vec<serde_json::Value> {
+    secrets
+        .iter()
+        .map(|secret| secret.trim())
+        .filter(|secret| !secret.is_empty())
+        .map(|secret| serde_json::json!({ "name": secret }))
+        .collect()
+}
+
+fn app_armor_profile_to_k8s(profile: &AppArmorProfile) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "type": profile.to_k8s_type()
+    });
+    if let Some(localhost_profile) = profile.localhost_profile() {
+        value["localhostProfile"] = serde_json::json!(localhost_profile);
+    }
+    value
 }
 
 fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_json::Value> {
@@ -1498,6 +1663,11 @@ fn apply_required_env(
         openshell_core::sandbox_env::SANDBOX_COMMAND,
         "sleep infinity",
     );
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::TELEMETRY_ENABLED,
+        openshell_core::telemetry::enabled_env_value(),
+    );
     if !ssh_socket_path.is_empty() {
         upsert_env(
             env,
@@ -1578,6 +1748,16 @@ fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde
         serde_json::Value::Object(m) if m.is_empty() => None,
         _ => Some(json),
     }
+}
+
+fn proto_struct_to_json_object(
+    config: &prost_types::Struct,
+) -> serde_json::Map<String, serde_json::Value> {
+    config
+        .fields
+        .iter()
+        .map(|(key, value)| (key.clone(), proto_value_to_json(value)))
+        .collect()
 }
 
 fn proto_value_to_json(value: &prost_types::Value) -> serde_json::Value {
@@ -1673,6 +1853,60 @@ mod tests {
         PROGRESS_COMPLETE_STEP_KEY,
     };
     use prost_types::{Struct, Value, value::Kind};
+
+    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    fn json_struct(value: serde_json::Value) -> Struct {
+        match json_value(value).kind {
+            Some(Kind::StructValue(value)) => value,
+            _ => panic!("expected JSON object"),
+        }
+    }
+
+    fn json_value(value: serde_json::Value) -> Value {
+        match value {
+            serde_json::Value::Null => Value { kind: None },
+            serde_json::Value::Bool(value) => Value {
+                kind: Some(Kind::BoolValue(value)),
+            },
+            serde_json::Value::Number(value) => Value {
+                kind: value.as_f64().map(Kind::NumberValue),
+            },
+            serde_json::Value::String(value) => Value {
+                kind: Some(Kind::StringValue(value)),
+            },
+            serde_json::Value::Array(values) => Value {
+                kind: Some(Kind::ListValue(prost_types::ListValue {
+                    values: values.into_iter().map(json_value).collect(),
+                })),
+            },
+            serde_json::Value::Object(values) => Value {
+                kind: Some(Kind::StructValue(Struct {
+                    fields: values
+                        .into_iter()
+                        .map(|(key, value)| (key, json_value(value)))
+                        .collect(),
+                })),
+            },
+        }
+    }
+
+    #[test]
+    fn driver_config_ignores_invalid_shape() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "pod": "not-an-object"
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let config = kubernetes_driver_config(&template);
+
+        assert!(config.pod.node_selector.is_empty());
+        assert!(config.containers.agent.resources.requests.is_empty());
+        assert!(config.containers.agent.resources.limits.is_empty());
+    }
 
     #[test]
     fn kube_pulling_event_adds_image_progress_metadata() {
@@ -2067,6 +2301,180 @@ mod tests {
     }
 
     #[test]
+    fn default_runtime_class_name_applied_when_template_omits_it() {
+        let template = SandboxTemplate::default();
+        let pod_template = {
+            let params = SandboxPodParams {
+                default_runtime_class_name: "kata-containers",
+                ..SandboxPodParams::default()
+            };
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("kata-containers")
+        );
+    }
+
+    #[test]
+    fn template_runtime_class_name_overrides_config_default() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "runtime_class_name".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("gvisor".to_string())),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams {
+                default_runtime_class_name: "kata-containers",
+                ..SandboxPodParams::default()
+            };
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("gvisor")
+        );
+    }
+
+    #[test]
+    fn driver_config_runtime_class_name_applies_to_pod_spec() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "pod": {
+                    "runtime_class_name": "kata-containers"
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("kata-containers")
+        );
+    }
+
+    #[test]
+    fn driver_config_runtime_class_name_overrides_config_default() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "pod": {
+                    "runtime_class_name": "kata-containers"
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams {
+                default_runtime_class_name: "gvisor",
+                ..SandboxPodParams::default()
+            };
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("kata-containers")
+        );
+    }
+
+    #[test]
+    fn template_runtime_class_name_overrides_driver_config() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "runtime_class_name".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("gvisor".to_string())),
+                    },
+                ))
+                .collect(),
+            }),
+            driver_config: Some(json_struct(serde_json::json!({
+                "pod": {
+                    "runtime_class_name": "kata-containers"
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("gvisor")
+        );
+    }
+
+    #[test]
+    fn runtime_class_name_omitted_when_both_template_and_default_empty() {
+        let template = SandboxTemplate::default();
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!(null)
+        );
+    }
+
+    #[test]
     fn gpu_sandbox_preserves_existing_resource_limits() {
         use openshell_core::proto::compute::v1::DriverResourceRequirements;
         let template = SandboxTemplate {
@@ -2368,6 +2776,65 @@ mod tests {
     }
 
     #[test]
+    fn app_armor_profile_omitted_by_default() {
+        let pod_template = default_template_to_k8s(false);
+        assert!(
+            pod_template["spec"]["containers"][0]["securityContext"]["appArmorProfile"].is_null(),
+            "appArmorProfile must be omitted when no profile is configured"
+        );
+    }
+
+    #[test]
+    fn app_armor_profile_renders_unconfined() {
+        let profile = AppArmorProfile::Unconfined;
+        let params = SandboxPodParams {
+            app_armor_profile: Some(&profile),
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["securityContext"]["appArmorProfile"],
+            serde_json::json!({ "type": "Unconfined" })
+        );
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"][0],
+            serde_json::json!("SYS_ADMIN"),
+            "AppArmor rendering must preserve required capabilities"
+        );
+    }
+
+    #[test]
+    fn app_armor_profile_renders_localhost_profile() {
+        let profile = AppArmorProfile::Localhost("openshell-supervisor".to_string());
+        let params = SandboxPodParams {
+            app_armor_profile: Some(&profile),
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["securityContext"]["appArmorProfile"],
+            serde_json::json!({
+                "type": "Localhost",
+                "localhostProfile": "openshell-supervisor"
+            })
+        );
+    }
+
+    #[test]
     fn user_namespaces_disabled_by_default() {
         let pod_template = default_template_to_k8s(false);
         assert!(
@@ -2530,6 +2997,80 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_template_omits_empty_image_pull_secrets() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &SandboxPodParams::default(),
+        );
+
+        assert!(
+            pod_template["spec"]["imagePullSecrets"].is_null(),
+            "imagePullSecrets must be omitted when no secrets are configured"
+        );
+    }
+
+    #[test]
+    fn sandbox_template_renders_configured_image_pull_secrets() {
+        let secrets = vec![
+            "regcred".to_string(),
+            " backup-regcred ".to_string(),
+            String::new(),
+        ];
+        let params = SandboxPodParams {
+            image_pull_secrets: &secrets,
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["imagePullSecrets"],
+            serde_json::json!([
+                { "name": "regcred" },
+                { "name": "backup-regcred" }
+            ])
+        );
+    }
+
+    #[test]
+    fn sandbox_template_renders_image_pull_secrets_for_template_image() {
+        let secrets = vec!["regcred".to_string()];
+        let params = SandboxPodParams {
+            default_image: "default-image:latest",
+            image_pull_secrets: &secrets,
+            ..Default::default()
+        };
+        let template = SandboxTemplate {
+            image: "private.example.com/team/sandbox:v1".to_string(),
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["image"],
+            serde_json::json!("private.example.com/team/sandbox:v1")
+        );
+        assert_eq!(
+            pod_template["spec"]["imagePullSecrets"],
+            serde_json::json!([{ "name": "regcred" }])
+        );
+    }
+
+    #[test]
     fn platform_config_bool_extracts_value() {
         let template = SandboxTemplate {
             platform_config: Some(Struct {
@@ -2581,6 +3122,37 @@ mod tests {
                 .any(|e| e["name"] == "OPENSHELL_LOG_LEVEL" && e["value"] == "debug")
         );
         assert!(cr["spec"].get("logLevel").is_none());
+    }
+
+    #[test]
+    fn telemetry_toggle_propagates_from_driver_env_to_sandbox_pod() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_vars(
+            [(
+                openshell_core::sandbox_env::TELEMETRY_ENABLED,
+                Some("false"),
+            )],
+            || {
+                let spec = SandboxSpec {
+                    environment: std::collections::HashMap::from([(
+                        openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
+                        "true".to_string(),
+                    )]),
+                    ..SandboxSpec::default()
+                };
+                let cr = sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default());
+                let env = cr["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
+                    .as_array()
+                    .unwrap();
+                let telemetry_entries = env
+                    .iter()
+                    .filter(|entry| entry["name"] == openshell_core::sandbox_env::TELEMETRY_ENABLED)
+                    .collect::<Vec<_>>();
+
+                assert_eq!(telemetry_entries.len(), 1);
+                assert_eq!(telemetry_entries[0]["value"], serde_json::json!("false"));
+            },
+        );
     }
 
     #[test]
@@ -2685,6 +3257,72 @@ mod tests {
         assert_eq!(tolerations[0]["key"], "nvidia.com/gpu");
         assert_eq!(tolerations[0]["operator"], "Exists");
         assert_eq!(tolerations[0]["effect"], "NoSchedule");
+    }
+
+    #[test]
+    fn driver_config_applies_pod_scheduling_and_agent_resources() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "pod": {
+                    "node_selector": {
+                        "accelerator": "nvidia"
+                    },
+                    "runtime_class_name": "kata-containers",
+                    "priority_class_name": "gpu-workload",
+                    "tolerations": [{
+                        "key": "nvidia.com/gpu",
+                        "operator": "Exists",
+                        "effect": "NoSchedule"
+                    }]
+                },
+                "containers": {
+                    "agent": {
+                        "resources": {
+                            "requests": {
+                                "vendor.example/gpu-memory": "8Gi"
+                            },
+                            "limits": {
+                                "vendor.example/gpu-slices": "1"
+                            }
+                        }
+                    }
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &SandboxPodParams::default(),
+        );
+
+        assert_eq!(
+            pod_template["spec"]["nodeSelector"]["accelerator"],
+            serde_json::json!("nvidia")
+        );
+        assert_eq!(
+            pod_template["spec"]["priorityClassName"],
+            serde_json::json!("gpu-workload")
+        );
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("kata-containers")
+        );
+        assert_eq!(
+            pod_template["spec"]["tolerations"][0]["key"],
+            serde_json::json!("nvidia.com/gpu")
+        );
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["resources"]["requests"]["vendor.example/gpu-memory"],
+            serde_json::json!("8Gi")
+        );
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["resources"]["limits"]["vendor.example/gpu-slices"],
+            serde_json::json!("1")
+        );
     }
 
     #[test]

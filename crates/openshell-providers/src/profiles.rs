@@ -16,10 +16,17 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+const PATH_TEMPLATE_CREDENTIAL_PLACEHOLDER: &str = "{credential}";
+
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/claude-code.yaml"),
+    include_str!("../../../providers/codex.yaml"),
+    include_str!("../../../providers/copilot.yaml"),
+    include_str!("../../../providers/cursor.yaml"),
     include_str!("../../../providers/github.yaml"),
+    include_str!("../../../providers/google-vertex-ai.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
+    include_str!("../../../providers/pypi.yaml"),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -81,6 +88,8 @@ pub struct CredentialProfile {
     pub query_param: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh: Option<CredentialRefreshProfile>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path_template: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -280,6 +289,7 @@ impl ProviderTypeProfile {
                         .refresh
                         .as_ref()
                         .map(credential_refresh_from_proto),
+                    path_template: credential.path_template.clone(),
                 })
                 .collect(),
             endpoints: profile.endpoints.iter().map(endpoint_from_proto).collect(),
@@ -306,6 +316,25 @@ impl ProviderTypeProfile {
         vars
     }
 
+    /// Whether this profile can be created without an initial access token because
+    /// the gateway can mint at least one credential immediately from refresh
+    /// material, and no required credential falls outside that gateway-mintable set.
+    #[must_use]
+    pub fn allows_gateway_refresh_bootstrap(&self) -> bool {
+        let mut has_gateway_mintable_credential = false;
+        for credential in &self.credentials {
+            let is_gateway_mintable = credential
+                .refresh
+                .as_ref()
+                .is_some_and(CredentialRefreshProfile::is_gateway_mintable);
+            if credential.required && !is_gateway_mintable {
+                return false;
+            }
+            has_gateway_mintable_credential |= is_gateway_mintable;
+        }
+        has_gateway_mintable_credential
+    }
+
     #[must_use]
     pub fn to_proto(&self) -> ProviderProfile {
         ProviderProfile {
@@ -325,6 +354,7 @@ impl ProviderTypeProfile {
                     header_name: credential.header_name.clone(),
                     query_param: credential.query_param.clone(),
                     refresh: credential.refresh.as_ref().map(credential_refresh_to_proto),
+                    path_template: credential.path_template.clone(),
                 })
                 .collect(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
@@ -342,6 +372,18 @@ impl ProviderTypeProfile {
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
         }
+    }
+}
+
+impl CredentialRefreshProfile {
+    #[must_use]
+    pub fn is_gateway_mintable(&self) -> bool {
+        matches!(
+            self.strategy,
+            ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+                | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+                | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
+        )
     }
 }
 
@@ -967,6 +1009,31 @@ pub fn validate_profile_set(
                         ));
                     }
                 }
+                "path" => {
+                    let path_template = credential.path_template.trim();
+                    if path_template.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.path_template",
+                            "path_template is required for path auth",
+                        ));
+                    } else {
+                        let count = path_template
+                            .matches(PATH_TEMPLATE_CREDENTIAL_PLACEHOLDER)
+                            .count();
+                        if count != 1 {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                "credentials.path_template",
+                                format!(
+                                    "path_template should contain {{credential}} exactly once, {path_template} contains {{credential}} {count} times",
+                                ),
+                        ));
+                        }
+                    }
+                }
                 "query" => {
                     if credential.query_param.trim().is_empty() {
                         diagnostics.push(ProfileValidationDiagnostic::error(
@@ -1150,6 +1217,89 @@ mod tests {
     }
 
     #[test]
+    fn vertex_profile_declares_discovery_and_fallback_token_env_vars() {
+        let profile = get_default_profile("google-vertex-ai").expect("vertex profile");
+        let service_account_token = profile
+            .credentials
+            .iter()
+            .find(|credential| credential.name == "service_account_token")
+            .expect("vertex service-account token credential");
+        let adc_credential = profile
+            .credentials
+            .iter()
+            .find(|credential| credential.name == "gcloud_adc_token")
+            .expect("vertex ADC credential");
+
+        assert_eq!(
+            service_account_token.env_vars,
+            vec![
+                "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string(),
+                "VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string()
+            ]
+        );
+        assert_eq!(
+            adc_credential.env_vars,
+            vec![
+                "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+                "VERTEX_AI_TOKEN".to_string()
+            ]
+        );
+        assert_eq!(
+            profile.discovery.credentials,
+            vec!["service_account_token", "gcloud_adc_token"]
+        );
+        assert!(
+            profile.allows_gateway_refresh_bootstrap(),
+            "Vertex profile should allow empty-create bootstrap via gateway-mintable credentials"
+        );
+    }
+
+    #[test]
+    fn refresh_bootstrap_requires_a_gateway_mintable_path_and_no_required_static_credentials() {
+        let optional_refresh_profile = parse_profile_yaml(
+            r"
+id: optional-refresh
+display_name: Optional Refresh
+credentials:
+  - name: access_token
+    required: false
+    refresh:
+      strategy: oauth2_refresh_token
+",
+        )
+        .expect("profile");
+        assert!(optional_refresh_profile.allows_gateway_refresh_bootstrap());
+
+        let mixed_required_profile = parse_profile_yaml(
+            r"
+id: mixed-required
+display_name: Mixed Required
+credentials:
+  - name: access_token
+    required: true
+    refresh:
+      strategy: oauth2_client_credentials
+  - name: static_key
+    required: true
+",
+        )
+        .expect("profile");
+        assert!(!mixed_required_profile.allows_gateway_refresh_bootstrap());
+
+        let static_only_profile = parse_profile_yaml(
+            r"
+id: static-only
+display_name: Static Only
+credentials:
+  - name: api_key
+    required: false
+",
+        )
+        .expect("profile");
+        assert!(!static_only_profile.allows_gateway_refresh_bootstrap());
+    }
+
+    #[test]
     fn parse_profile_yaml_reads_single_provider_document() {
         let profile = parse_profile_yaml(
             r"
@@ -1230,6 +1380,63 @@ credentials:
         let exported = profile_to_yaml(&from_proto).expect("yaml");
         assert!(exported.contains("oauth2_client_credentials"));
         assert!(exported.contains("client_secret"));
+    }
+
+    #[test]
+    fn credential_fields_round_trip_through_proto_and_yaml() {
+        let profile = parse_profile_yaml(
+            r"
+id: multi-auth
+display_name: Multi Auth
+credentials:
+  - name: basic_cred
+    env_vars: [BASIC_TOKEN]
+    auth_style: basic
+  - name: bearer_cred
+    env_vars: [BEARER_TOKEN]
+    auth_style: bearer
+    header_name: authorization
+  - name: query_cred
+    env_vars: [QUERY_TOKEN]
+    auth_style: query
+    query_param: api_key
+  - name: path_cred
+    env_vars: [PATH_TOKEN]
+    auth_style: path
+    path_template: /v1/{credential}/resources
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("multi-auth.yaml".to_string(), profile.clone())]);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+
+        assert_eq!(profile.credentials[1].header_name, "authorization");
+        assert_eq!(profile.credentials[2].query_param, "api_key");
+        assert_eq!(
+            profile.credentials[3].path_template,
+            "/v1/{credential}/resources"
+        );
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        assert_eq!(from_proto.credentials[1].header_name, "authorization");
+        assert_eq!(from_proto.credentials[2].query_param, "api_key");
+        assert_eq!(
+            from_proto.credentials[3].path_template,
+            "/v1/{credential}/resources"
+        );
+
+        let exported = profile_to_yaml(&from_proto).expect("yaml");
+        let reparsed = parse_profile_yaml(&exported).expect("re-parse");
+        assert_eq!(reparsed.credentials[1].header_name, "authorization");
+        assert_eq!(reparsed.credentials[2].query_param, "api_key");
+        assert_eq!(
+            reparsed.credentials[3].path_template,
+            "/v1/{credential}/resources"
+        );
     }
 
     #[test]
@@ -1339,6 +1546,13 @@ credentials:
   - name: api_key
     env_vars: [BROKEN_TOKEN, ""]
     auth_style: unknown
+  - name: path_key
+    env_vars: [PATH_TOKEN]
+    auth_style: path
+  - name: path_key_bad
+    env_vars: [PATH_TOKEN_BAD]
+    auth_style: path
+    path_template: /v1/{key}/resources
 discovery:
   credentials: [api_key, missing_key]
 endpoints:
@@ -1359,6 +1573,11 @@ binaries: ["", /usr/bin/broken]
         assert!(messages.contains(&"duplicate credential env var 'BROKEN_TOKEN'"));
         assert!(messages.contains(&"credential env var must not be empty"));
         assert!(messages.contains(&"query_param is required for query auth"));
+        assert!(messages.contains(&"path_template is required for path auth"));
+        assert!(messages.iter().any(|message| {
+            message.contains("should contain {credential} exactly once")
+                && message.contains("0 times")
+        }));
         assert!(messages.contains(&"unsupported auth_style: unknown"));
         assert!(messages.contains(&"unknown discovery credential: missing_key"));
         assert!(

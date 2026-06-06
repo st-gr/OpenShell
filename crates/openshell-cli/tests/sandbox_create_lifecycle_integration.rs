@@ -780,9 +780,10 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         Some("default-command"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
+        None,
         None,
         None,
         None,
@@ -822,12 +823,13 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
         Some("resources"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
         None,
         Some("500m"),
         Some("2Gi"),
+        None,
         None,
         &[],
         None,
@@ -885,6 +887,79 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
 }
 
 #[tokio::test]
+async fn sandbox_create_sends_driver_config_json() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        Some("driver-config"),
+        None,
+        "openshell",
+        &[],
+        true,
+        false,
+        None,
+        None,
+        None,
+        Some(r#"{"kubernetes":{"pod":{"priority_class_name":"batch-low"}}}"#),
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        "manual",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    let driver_config = requests[0]
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .and_then(|template| template.driver_config.as_ref())
+        .expect("driver config should be sent");
+    let kubernetes = driver_config
+        .fields
+        .get("kubernetes")
+        .and_then(|value| value.kind.as_ref())
+        .and_then(|kind| match kind {
+            prost_types::value::Kind::StructValue(inner) => Some(inner),
+            _ => None,
+        })
+        .expect("kubernetes block should be a struct");
+    let pod = kubernetes
+        .fields
+        .get("pod")
+        .and_then(|value| value.kind.as_ref())
+        .and_then(|kind| match kind {
+            prost_types::value::Kind::StructValue(inner) => Some(inner),
+            _ => None,
+        })
+        .expect("pod block should be a struct");
+
+    assert_eq!(
+        pod.fields
+            .get("priority_class_name")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                _ => None,
+            }),
+        Some("batch-low")
+    );
+}
+
+#[tokio::test]
 async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
     let server = run_server().await;
     enable_providers_v2(&server).await;
@@ -899,9 +974,10 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
         Some("v2-no-inferred-provider"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
+        None,
         None,
         None,
         None,
@@ -956,9 +1032,10 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
         Some("vm-error"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
+        None,
         None,
         None,
         None,
@@ -1009,9 +1086,10 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
         Some("vm-slow-progress"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
+        None,
         None,
         None,
         None,
@@ -1054,9 +1132,10 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
         Some("vm-log-churn"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
+        None,
         None,
         None,
         None,
@@ -1095,9 +1174,10 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         Some("ephemeral-command"),
         None,
         "openshell",
+        &[],
+        false,
+        false,
         None,
-        false,
-        false,
         None,
         None,
         None,
@@ -1140,9 +1220,10 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         Some("ephemeral-shell"),
         None,
         "openshell",
+        &[],
+        false,
+        false,
         None,
-        false,
-        false,
         None,
         None,
         None,
@@ -1185,9 +1266,10 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         Some("persistent-keep"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
+        None,
         None,
         None,
         None,
@@ -1230,9 +1312,10 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         Some("persistent-forward"),
         None,
         "openshell",
+        &[],
+        false,
+        false,
         None,
-        false,
-        false,
         None,
         None,
         None,

@@ -15,6 +15,7 @@ use crate::sandbox_watch::SandboxWatchBus;
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
+use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
@@ -257,6 +258,7 @@ pub async fn connect_external_compute_driver(
 #[derive(Clone)]
 pub struct ComputeRuntime {
     driver: SharedComputeDriver,
+    driver_kind: Option<ComputeDriverKind>,
     shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
     startup_resume: Option<Arc<dyn StartupResume>>,
     _driver_process: Option<Arc<ManagedDriverProcess>>,
@@ -279,6 +281,7 @@ impl fmt::Debug for ComputeRuntime {
 impl ComputeRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn from_driver(
+        driver_kind: ComputeDriverKind,
         driver: SharedComputeDriver,
         shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
         startup_resume: Option<Arc<dyn StartupResume>>,
@@ -299,6 +302,7 @@ impl ComputeRuntime {
             .default_image;
         Ok(Self {
             driver,
+            driver_kind: Some(driver_kind),
             shutdown_cleanup,
             startup_resume,
             _driver_process: driver_process,
@@ -342,6 +346,7 @@ impl ComputeRuntime {
         let startup_resume: Arc<dyn StartupResume> = driver.clone();
         let driver: SharedComputeDriver = driver;
         Self::from_driver(
+            ComputeDriverKind::Docker,
             driver,
             Some(shutdown_cleanup),
             Some(startup_resume),
@@ -370,6 +375,7 @@ impl ComputeRuntime {
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(ComputeDriverService::new(driver));
         Self::from_driver(
+            ComputeDriverKind::Kubernetes,
             driver,
             None,
             None,
@@ -396,6 +402,7 @@ impl ComputeRuntime {
     ) -> Result<Self, ComputeError> {
         let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
         Self::from_driver(
+            ComputeDriverKind::Vm,
             driver,
             None,
             None,
@@ -456,6 +463,7 @@ impl ComputeRuntime {
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
         Self::from_driver(
+            ComputeDriverKind::Podman,
             driver,
             None,
             None,
@@ -477,12 +485,18 @@ impl ComputeRuntime {
     }
 
     #[must_use]
+    pub fn driver_kind(&self) -> Option<ComputeDriverKind> {
+        self.driver_kind
+    }
+
+    #[must_use]
     pub fn gateway_bind_addresses(&self) -> &[SocketAddr] {
         &self.gateway_bind_addresses
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        let driver_sandbox = driver_sandbox_from_public(sandbox);
+        let driver_sandbox =
+            driver_sandbox_from_public(sandbox, self.driver_kind).map_err(|status| *status)?;
         self.driver
             .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
                 sandbox: Some(driver_sandbox),
@@ -497,6 +511,8 @@ impl ComputeRuntime {
         sandbox_token: Option<String>,
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
+        let mut driver_sandbox =
+            driver_sandbox_from_public(&sandbox, self.driver_kind).map_err(|status| *status)?;
 
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
@@ -526,7 +542,6 @@ impl ComputeRuntime {
                 }
             })?;
 
-        let mut driver_sandbox = driver_sandbox_from_public(&sandbox);
         if let Some(token) = sandbox_token
             && let Some(spec) = driver_sandbox.spec.as_mut()
         {
@@ -608,12 +623,11 @@ impl ComputeRuntime {
         self.sandbox_watch_bus.notify(&id);
         self.cleanup_sandbox_owned_records(&sandbox).await;
 
-        let driver_sandbox = driver_sandbox_from_public(&sandbox);
         let deleted = self
             .driver
             .delete_sandbox(Request::new(DeleteSandboxRequest {
-                sandbox_id: driver_sandbox.id,
-                sandbox_name: driver_sandbox.name,
+                sandbox_id: sandbox.object_id().to_string(),
+                sandbox_name: sandbox.object_name().to_string(),
             }))
             .await
             .map(|response| response.into_inner().deleted)
@@ -1306,38 +1320,75 @@ impl ComputeRuntime {
     }
 }
 
-fn driver_sandbox_from_public(sandbox: &Sandbox) -> DriverSandbox {
-    DriverSandbox {
+fn driver_sandbox_from_public(
+    sandbox: &Sandbox,
+    driver_kind: Option<ComputeDriverKind>,
+) -> Result<DriverSandbox, Box<Status>> {
+    Ok(DriverSandbox {
         id: sandbox.object_id().to_string(),
         name: sandbox.object_name().to_string(),
         namespace: String::new(), // Namespace is set by the driver based on its config
-        spec: sandbox.spec.as_ref().map(driver_sandbox_spec_from_public),
+        spec: sandbox
+            .spec
+            .as_ref()
+            .map(|spec| driver_sandbox_spec_from_public(spec, driver_kind))
+            .transpose()?,
         status: sandbox.status.as_ref().map(driver_status_from_public),
-    }
+    })
 }
 
-fn driver_sandbox_spec_from_public(spec: &SandboxSpec) -> DriverSandboxSpec {
-    DriverSandboxSpec {
+fn driver_sandbox_spec_from_public(
+    spec: &SandboxSpec,
+    driver_kind: Option<ComputeDriverKind>,
+) -> Result<DriverSandboxSpec, Box<Status>> {
+    Ok(DriverSandboxSpec {
         log_level: spec.log_level.clone(),
         environment: spec.environment.clone(),
         template: spec
             .template
             .as_ref()
-            .map(driver_sandbox_template_from_public),
+            .map(|template| driver_sandbox_template_from_public(template, driver_kind))
+            .transpose()?,
         gpu: spec.gpu,
         gpu_device: spec.gpu_device.clone(),
         sandbox_token: String::new(),
-    }
+    })
 }
 
-fn driver_sandbox_template_from_public(template: &SandboxTemplate) -> DriverSandboxTemplate {
-    DriverSandboxTemplate {
+fn driver_sandbox_template_from_public(
+    template: &SandboxTemplate,
+    driver_kind: Option<ComputeDriverKind>,
+) -> Result<DriverSandboxTemplate, Box<Status>> {
+    Ok(DriverSandboxTemplate {
         image: template.image.clone(),
         agent_socket_path: template.agent_socket.clone(),
         labels: template.labels.clone(),
         environment: template.environment.clone(),
         resources: extract_typed_resources(&template.resources),
         platform_config: build_platform_config(template),
+        driver_config: select_driver_config(&template.driver_config, driver_kind)?,
+    })
+}
+
+fn select_driver_config(
+    config: &Option<prost_types::Struct>,
+    driver_kind: Option<ComputeDriverKind>,
+) -> Result<Option<prost_types::Struct>, Box<Status>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let Some(driver_kind) = driver_kind else {
+        return Ok(None);
+    };
+    let driver_name = driver_kind.as_str();
+    let Some(value) = config.fields.get(driver_name) else {
+        return Ok(None);
+    };
+    match value.kind.as_ref() {
+        Some(prost_types::value::Kind::StructValue(inner)) => Ok(Some(inner.clone())),
+        _ => Err(Box::new(Status::invalid_argument(format!(
+            "template.driver_config.{driver_name} must be an object"
+        )))),
     }
 }
 
@@ -1700,11 +1751,16 @@ fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Opti
 /// Phases for which a sandbox should have a running compute resource.
 /// `Deleting` and `Error` are intentionally excluded: deletion is in
 /// progress, or the sandbox has already failed and should not be
-/// silently revived.
+/// silently revived. `Unspecified` is included because it is the proto
+/// default value; persisted rows with that value should be reconciled
+/// from the live driver state rather than skipped forever.
 fn sandbox_phase_should_be_running(phase: SandboxPhase) -> bool {
     matches!(
         phase,
-        SandboxPhase::Provisioning | SandboxPhase::Ready | SandboxPhase::Unknown
+        SandboxPhase::Unspecified
+            | SandboxPhase::Provisioning
+            | SandboxPhase::Ready
+            | SandboxPhase::Unknown
     )
 }
 
@@ -1741,8 +1797,6 @@ impl ComputeDriver for NoopTestDriver {
                 driver_name: "noop-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
-                supports_gpu: false,
-                gpu_count: 0,
             },
         ))
     }
@@ -1821,6 +1875,7 @@ impl ComputeDriver for NoopTestDriver {
 pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
     ComputeRuntime {
         driver: Arc::new(NoopTestDriver),
+        driver_kind: None,
         shutdown_cleanup: None,
         startup_resume: None,
         _driver_process: None,
@@ -1872,6 +1927,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn select_driver_config_forwards_only_matching_driver_block() {
+        let config = prost_types::Struct {
+            fields: [
+                (
+                    "kubernetes".to_string(),
+                    struct_value([("node", string_value("gpu"))]),
+                ),
+                (
+                    "docker".to_string(),
+                    struct_value([("network_mode", string_value("bridge"))]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let selected =
+            select_driver_config(&Some(config), Some(ComputeDriverKind::Kubernetes)).unwrap();
+        let selected = selected.expect("kubernetes config should be selected");
+
+        assert!(selected.fields.contains_key("node"));
+        assert!(!selected.fields.contains_key("network_mode"));
+    }
+
+    #[test]
+    fn select_driver_config_ignores_non_matching_driver_blocks() {
+        let config = prost_types::Struct {
+            fields: std::iter::once((
+                "docker".to_string(),
+                struct_value([("network_mode", string_value("bridge"))]),
+            ))
+            .collect(),
+        };
+
+        let selected =
+            select_driver_config(&Some(config), Some(ComputeDriverKind::Kubernetes)).unwrap();
+
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn select_driver_config_rejects_non_object_matching_driver_block() {
+        let config = prost_types::Struct {
+            fields: std::iter::once(("kubernetes".to_string(), string_value("not-an-object")))
+                .collect(),
+        };
+
+        let err =
+            select_driver_config(&Some(config), Some(ComputeDriverKind::Kubernetes)).unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("template.driver_config.kubernetes"));
+    }
+
     #[derive(Debug, Default)]
     struct TestDriver {
         listed_sandboxes: Vec<DriverSandbox>,
@@ -1890,8 +2000,6 @@ mod tests {
                 driver_name: "test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
-                supports_gpu: true,
-                gpu_count: 0,
             }))
         }
 
@@ -1988,6 +2096,7 @@ mod tests {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
             driver,
+            driver_kind: None,
             shutdown_cleanup: None,
             startup_resume,
             _driver_process: None,
@@ -2858,6 +2967,7 @@ mod tests {
             test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
 
         for (id, name, phase) in [
+            ("sb-unspecified", "unspecified", SandboxPhase::Unspecified),
             ("sb-prov", "prov", SandboxPhase::Provisioning),
             ("sb-ready", "ready", SandboxPhase::Ready),
             ("sb-unknown", "unknown", SandboxPhase::Unknown),
@@ -2883,6 +2993,7 @@ mod tests {
                 "sb-prov".to_string(),
                 "sb-ready".to_string(),
                 "sb-unknown".to_string(),
+                "sb-unspecified".to_string(),
             ]
         );
     }

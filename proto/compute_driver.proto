@@ -45,16 +45,15 @@ service ComputeDriver {
 message GetCapabilitiesRequest {}
 
 message GetCapabilitiesResponse {
+  reserved 4, 5;
+  reserved "supports_gpu", "gpu_count";
+
   // Human-readable driver name.
   string driver_name = 1;
   // Driver implementation version string.
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
-  // True when the driver can provision GPU-backed sandboxes.
-  bool supports_gpu = 4;
-  // Number of GPUs available for sandbox assignment.
-  uint32 gpu_count = 5;
 }
 
 // Driver-owned sandbox model used for create requests and platform observations.
@@ -122,6 +121,10 @@ message DriverSandboxTemplate {
   // For the Kubernetes driver this carries fields such as runtimeClassName,
   // annotations, and volumeClaimTemplates.
   google.protobuf.Struct platform_config = 11;
+  // Caller-provided config for the selected driver only.
+  // This is the inner block selected from public SandboxTemplate.driver_config.
+  // The selected driver owns nested schema validation.
+  google.protobuf.Struct driver_config = 12;
 }
 
 // Typed compute-resource requirements.

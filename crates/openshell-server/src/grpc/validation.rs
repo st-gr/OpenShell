@@ -200,6 +200,14 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
             )));
         }
     }
+    if let Some(ref s) = tmpl.driver_config {
+        let size = s.encoded_len();
+        if size > MAX_TEMPLATE_STRUCT_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "template.driver_config serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
+            )));
+        }
+    }
 
     Ok(())
 }
@@ -239,7 +247,7 @@ pub(super) fn validate_string_map(
 // Provider field validation
 // ---------------------------------------------------------------------------
 
-/// Validate field sizes on a `Provider` before persisting.
+/// Validate field sizes on a `Provider` before persisting a new record.
 pub(super) fn validate_provider_fields(provider: &Provider) -> Result<(), Status> {
     let name_len = provider.metadata.as_ref().map_or(0, |m| m.name.len());
     if name_len > MAX_NAME_LEN {
@@ -253,6 +261,17 @@ pub(super) fn validate_provider_fields(provider: &Provider) -> Result<(), Status
             provider.r#type.len()
         )));
     }
+    validate_provider_mutable_fields(provider)
+}
+
+/// Validate field sizes on a `Provider` before persisting an update.
+///
+/// Skips the immutable `name` and `type` fields, which are carried forward from
+/// the existing record. Re-checking them would block credential rotation on any
+/// legacy record whose stored `name`/`type` predates current limits (or was
+/// written by a path that bypassed validation), even though the caller never
+/// touches those fields. See #1347.
+pub(super) fn validate_provider_mutable_fields(provider: &Provider) -> Result<(), Status> {
     validate_string_map(
         &provider.credentials,
         MAX_PROVIDER_CREDENTIALS_ENTRIES,

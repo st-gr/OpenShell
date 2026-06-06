@@ -17,9 +17,11 @@ use openshell_core::proto::compute::v1::{
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{LazyLock, Mutex};
 use tempfile::TempDir;
 
 const TLS_MOUNT_DIR: &str = "/etc/openshell/tls/client";
+static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn test_sandbox() -> DriverSandbox {
     // Mirrors the gateway-supplied request: the public `Sandbox` API no
@@ -37,8 +39,7 @@ fn test_sandbox() -> DriverSandbox {
                 agent_socket_path: String::new(),
                 labels: HashMap::new(),
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
-                resources: None,
-                platform_config: None,
+                ..Default::default()
             }),
             gpu: false,
             gpu_device: String::new(),
@@ -389,7 +390,7 @@ fn docker_resource_limits_rejects_requests() {
             memory_request: String::new(),
             memory_limit: String::new(),
         }),
-        platform_config: None,
+        ..Default::default()
     };
 
     let err = docker_resource_limits(&template).unwrap_err();
@@ -409,7 +410,7 @@ fn docker_resource_limits_applies_cpu_and_memory_limits() {
             memory_limit: "2Gi".to_string(),
             ..Default::default()
         }),
-        platform_config: None,
+        ..Default::default()
     };
 
     let limits = docker_resource_limits(&template).unwrap();
@@ -466,6 +467,41 @@ fn build_environment_keeps_path_driver_controlled() {
     let expected_path = format!("PATH={SUPERVISOR_PATH}");
     assert_eq!(path_entries.len(), 1);
     assert_eq!(path_entries[0], &expected_path);
+}
+
+#[test]
+fn build_environment_keeps_telemetry_toggle_driver_controlled() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    temp_env::with_vars(
+        [(
+            openshell_core::sandbox_env::TELEMETRY_ENABLED,
+            Some("false"),
+        )],
+        || {
+            let mut sandbox = test_sandbox();
+            sandbox.spec.as_mut().unwrap().environment.insert(
+                openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
+                "true".to_string(),
+            );
+
+            let env = build_environment(&sandbox, &runtime_config());
+            let telemetry_entries = env
+                .iter()
+                .filter(|entry| {
+                    entry.starts_with(&format!(
+                        "{}=",
+                        openshell_core::sandbox_env::TELEMETRY_ENABLED
+                    ))
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(telemetry_entries.len(), 1);
+            assert_eq!(
+                telemetry_entries[0],
+                &format!("{}=false", openshell_core::sandbox_env::TELEMETRY_ENABLED)
+            );
+        },
+    );
 }
 
 #[test]

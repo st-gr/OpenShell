@@ -253,7 +253,8 @@ message IssueSandboxTokenRequest {}
 message IssueSandboxTokenResponse {
   // Gateway-minted JWT bound to the calling sandbox's UUID.
   string token = 1;
-  // Absolute expiry of the issued token, milliseconds since the epoch.
+  // Absolute expiry of the issued token, milliseconds since the epoch. 0 means
+  // the token is non-expiring.
   int64 expires_at_ms = 2;
 }
 
@@ -267,7 +268,8 @@ message RefreshSandboxTokenRequest {}
 message RefreshSandboxTokenResponse {
   // Fresh gateway-minted JWT bound to the same sandbox UUID.
   string token = 1;
-  // Absolute expiry of the new token, milliseconds since the epoch.
+  // Absolute expiry of the new token, milliseconds since the epoch. 0 means
+  // the token is non-expiring.
   int64 expires_at_ms = 2;
 }
 
@@ -353,6 +355,11 @@ message SandboxTemplate {
   // available (beta through 1.35, GA in 1.36+) and a supporting runtime.
   // When unset, the cluster-wide default is used.
   optional bool user_namespaces = 10;
+  // Driver-keyed opaque config envelope supplied by the caller.
+  // The gateway selects the block matching the active compute driver and
+  // forwards only that inner Struct to DriverSandboxTemplate.driver_config.
+  // The selected driver owns nested schema validation.
+  google.protobuf.Struct driver_config = 11;
 }
 
 // User-facing sandbox status derived by the gateway from compute-driver observations.
@@ -895,6 +902,7 @@ message ProviderProfileCredential {
   string header_name = 6;
   string query_param = 7;
   ProviderCredentialRefresh refresh = 8;
+  string path_template = 9;
 }
 
 enum ProviderCredentialRefreshStrategy {
@@ -1486,6 +1494,25 @@ message DenialSummary {
   bool l7_inspection_active = 17;
 }
 
+// Count of denied actions grouped only by sanitized telemetry category.
+message DenialGroupCount {
+  // Sanitized denial category, e.g. "connect_policy", "l7_policy", "ssrf".
+  string deny_group = 1;
+  // Number of denied actions in this category.
+  uint32 denied_count = 2;
+}
+
+// Anonymous sandbox network activity counters. This intentionally excludes
+// hosts, paths, binaries, raw deny reasons, sandbox IDs, and user content.
+message NetworkActivitySummary {
+  // Total observed network activities in the current window.
+  uint32 network_activity_count = 1;
+  // Total denied actions in the current window.
+  uint32 denied_action_count = 2;
+  // Denied action counts grouped by sanitized category.
+  repeated DenialGroupCount denials_by_group = 3;
+}
+
 // A proposed policy rule with rationale and approval status.
 message PolicyChunk {
   // Unique chunk identifier.
@@ -1559,6 +1586,8 @@ message SubmitPolicyAnalysisRequest {
   string analysis_mode = 3;
   // Sandbox name.
   string name = 4;
+  // Anonymous network activity counters.
+  repeated NetworkActivitySummary network_activity_summaries = 5;
 }
 
 message SubmitPolicyAnalysisResponse {
