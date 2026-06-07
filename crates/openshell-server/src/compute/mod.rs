@@ -496,8 +496,8 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        let driver_sandbox =
-            driver_sandbox_from_public(sandbox, self.driver_kind.clone()).map_err(|status| *status)?;
+        let driver_sandbox = driver_sandbox_from_public(sandbox, self.driver_kind.clone())
+            .map_err(|status| *status)?;
         self.driver
             .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
                 sandbox: Some(driver_sandbox),
@@ -512,8 +512,8 @@ impl ComputeRuntime {
         sandbox_token: Option<String>,
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
-        let mut driver_sandbox =
-            driver_sandbox_from_public(&sandbox, self.driver_kind.clone()).map_err(|status| *status)?;
+        let mut driver_sandbox = driver_sandbox_from_public(&sandbox, self.driver_kind.clone())
+            .map_err(|status| *status)?;
 
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
