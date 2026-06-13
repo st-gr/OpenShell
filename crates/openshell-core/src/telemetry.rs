@@ -188,12 +188,13 @@ impl TelemetryComputeDriver {
     }
 
     #[must_use]
-    pub const fn from_driver_kind(driver_kind: Option<crate::ComputeDriverKind>) -> Self {
+    pub fn from_driver_kind(driver_kind: Option<crate::ComputeDriverKind>) -> Self {
         match driver_kind {
             Some(crate::ComputeDriverKind::Docker) => Self::Docker,
             Some(crate::ComputeDriverKind::Kubernetes) => Self::Kubernetes,
             Some(crate::ComputeDriverKind::Podman) => Self::Podman,
             Some(crate::ComputeDriverKind::Vm) => Self::Vm,
+            Some(crate::ComputeDriverKind::External(_)) => Self::Unknown,
             None => Self::Unknown,
         }
     }
